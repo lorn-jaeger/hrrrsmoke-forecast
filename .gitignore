@@ -13,10 +13,12 @@ output.txt
 
 # Pipeline outputs
 data/
+reports/
 reports/figures/
 *.parquet
 *.zarr/
 *.json
+check.py
 
 # macOS
 .DS_Store
