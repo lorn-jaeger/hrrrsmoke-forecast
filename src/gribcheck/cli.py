@@ -80,6 +80,12 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Use only +24h next-day actual analysis label (no +12h label).",
     )
+    wildfire_parser.add_argument(
+        "--daily-aggregate",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Aggregate selected source hours into one daily sample (labels follow selected target mode).",
+    )
 
     return parser
 
@@ -144,6 +150,7 @@ def main() -> None:
             workers=args.workers,
             sample_hours_utc=_parse_hours_csv(args.sample_hours_utc),
             next_day_only=bool(args.next_day_only),
+            daily_aggregate=bool(args.daily_aggregate),
         )
         print(stats)
         return

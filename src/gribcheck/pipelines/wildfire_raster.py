@@ -7,7 +7,7 @@ import shutil
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from threading import local
 
@@ -224,6 +224,146 @@ def _normalize_sample_hours(sample_hours_utc: tuple[int, ...] | None) -> set[int
     return out
 
 
+def _iter_fire_days(
+    rec: FireRecord,
+    cap: int | None,
+    run_start: date,
+    run_end: date,
+    require_next_day: bool,
+    max_days_per_fire: int | None = None,
+):
+    start_day = max(rec.start_date, run_start)
+    end_day = min(rec.end_date, run_end)
+    if require_next_day:
+        end_day = min(end_day, run_end - timedelta(days=1))
+    if end_day < start_day:
+        return
+
+    emitted = 0
+    day = start_day
+    while day <= end_day:
+        if max_days_per_fire is not None and emitted >= int(max_days_per_fire):
+            break
+        yield day
+        emitted += 1
+        if cap is not None and emitted >= cap:
+            break
+        day += timedelta(days=1)
+
+
+def _days_in_fire_window(
+    rec: FireRecord,
+    cap: int | None,
+    run_start: date,
+    run_end: date,
+    require_next_day: bool,
+) -> int:
+    return sum(
+        1
+        for _ in _iter_fire_days(
+            rec,
+            cap=cap,
+            run_start=run_start,
+            run_end=run_end,
+            require_next_day=require_next_day,
+            max_days_per_fire=None,
+        )
+    )
+
+
+def _estimate_total_daily_samples(
+    records: list[FireRecord],
+    cap: int | None,
+    run_start: date,
+    run_end: date,
+    require_next_day: bool,
+) -> int:
+    return int(
+        sum(
+            _days_in_fire_window(
+                r,
+                cap=cap,
+                run_start=run_start,
+                run_end=run_end,
+                require_next_day=require_next_day,
+            )
+            for r in records
+        )
+    )
+
+
+def _build_daily_reduction_plan(
+    config: PipelineConfig,
+    records: list[FireRecord],
+    label_count: int,
+    require_next_day: bool,
+) -> tuple[ReductionPlan, int, int]:
+    active_specs = list(config.wildfire.analysis_variables)
+
+    include_upper_air = True
+    cap = None
+    actions: list[str] = []
+
+    def current_specs() -> list[VariableSpec]:
+        if include_upper_air:
+            return list(active_specs)
+        return [spec for spec in active_specs if not _is_upper_air_or_dzdt(spec)]
+
+    budget_bytes = int(config.storage.budget_gb * (1024**3))
+
+    while True:
+        sample_count = _estimate_total_daily_samples(
+            records,
+            cap=cap,
+            run_start=config.run.start_date,
+            run_end=config.run.end_date,
+            require_next_day=require_next_day,
+        )
+        ch_count = len(current_specs()) + 1
+        est_bytes = _estimate_dataset_bytes(
+            sample_count=sample_count,
+            channel_count=ch_count,
+            label_count=label_count,
+            patch_size=config.wildfire.patch_size,
+        )
+
+        if est_bytes <= budget_bytes:
+            plan = ReductionPlan(
+                include_upper_air=include_upper_air,
+                cadence_after_72h=1,
+                cap_samples_per_fire=cap,
+                actions=actions,
+            )
+            return plan, sample_count, est_bytes
+
+        if include_upper_air and config.storage.drop_upper_air_and_dzdt:
+            include_upper_air = False
+            actions.append("drop_upper_air_and_dzdt")
+            continue
+
+        if cap is None:
+            cap = config.storage.cap_samples_per_fire
+            actions.append(f"cap_samples_per_fire={cap}")
+            continue
+
+        plan = ReductionPlan(
+            include_upper_air=include_upper_air,
+            cadence_after_72h=1,
+            cap_samples_per_fire=cap,
+            actions=actions,
+        )
+        return plan, sample_count, est_bytes
+
+
+def _utc_datetime(day_utc: date, hour_utc: int) -> datetime:
+    return datetime.combine(day_utc, time(hour_utc, 0), tzinfo=timezone.utc)
+
+
+def _mean_patches(patches: list[np.ndarray]) -> np.ndarray:
+    stack = np.stack(patches, axis=0).astype(np.float32, copy=False)
+    return np.mean(stack, axis=0, dtype=np.float32)
+
+
 def _build_bounds_xy(rec: FireRecord, buffer_km: float):
     transformer = hrrr_transformer_to_xy()
     x0, y0 = transformer.transform(rec.min_lon, rec.min_lat)
@@ -398,6 +538,7 @@ def run(
     workers: int | None = None,
     sample_hours_utc: tuple[int, ...] | None = None,
     next_day_only: bool = False,
+    daily_aggregate: bool = False,
 ) -> WildfireRasterStats:
     records = load_filtered_fire_records(config)
     if not records:
@@ -405,14 +546,31 @@ def run(
     if max_fires is not None:
         records = records[: int(max_fires)]
 
-    sample_hours = _normalize_sample_hours(sample_hours_utc)
+    if daily_aggregate and not next_day_only:
+        raise ValueError("daily_aggregate mode requires --next-day-only for an unambiguous daily target")
+
+    normalized_hours = _normalize_sample_hours(sample_hours_utc)
+    if daily_aggregate and normalized_hours is None:
+        sample_hours = {0, 6, 12, 18}
+    else:
+        sample_hours = normalized_hours
+
     leads = [24] if next_day_only else sorted(config.wildfire.label_lead_hours)
-    reduction_plan, estimated_samples, estimated_bytes = _build_reduction_plan(
-        config,
-        records,
-        label_count=len(leads),
-        sample_hours_utc=sample_hours,
-    )
+
+    if daily_aggregate:
+        reduction_plan, estimated_samples, estimated_bytes = _build_daily_reduction_plan(
+            config,
+            records,
+            label_count=len(leads),
+            require_next_day=bool(next_day_only),
+        )
+    else:
+        reduction_plan, estimated_samples, estimated_bytes = _build_reduction_plan(
+            config,
+            records,
+            label_count=len(leads),
+            sample_hours_utc=sample_hours,
+        )
 
     active_specs = list(config.wildfire.analysis_variables)
     if not reduction_plan.include_upper_air:
@@ -443,8 +601,9 @@ def run(
 
     sample_count = 0
     LOGGER.info(
-        "Building wildfire raster dataset with %d worker(s) for HRRR extraction; sample_hours_utc=%s; next_day_only=%s",
+        "Building wildfire raster dataset with %d worker(s) for HRRR extraction; daily_aggregate=%s; sample_hours_utc=%s; next_day_only=%s",
         worker_count,
+        daily_aggregate,
         sorted(sample_hours) if sample_hours is not None else "all",
         next_day_only,
     )
@@ -455,81 +614,125 @@ def run(
                 LOGGER.info("Processing fire %d / %d", fire_idx + 1, len(records))
 
             bounds_xy = _build_bounds_xy(rec, buffer_km=config.wildfire.buffer_km)
+            if daily_aggregate:
+                if sample_hours is None:
+                    raise ValueError("daily_aggregate mode requires explicit sample hours")
+                sample_hours_sorted = sorted(sample_hours)
+                max_days_per_fire = int(max_hours_per_fire) if max_hours_per_fire is not None else None
+                sample_iterator = (
+                    (sample_day, _utc_datetime(sample_day, sample_hours_sorted[0]))
+                    for sample_day in _iter_fire_days(
+                        rec,
+                        cap=reduction_plan.cap_samples_per_fire,
+                        run_start=config.run.start_date,
+                        run_end=config.run.end_date,
+                        require_next_day=bool(next_day_only),
+                        max_days_per_fire=max_days_per_fire,
+                    )
+                )
+            else:
+                sample_iterator = (
+                    (run_time.date(), run_time)
+                    for run_time in _iter_fire_hours(
+                        rec,
+                        cadence_after_72h=reduction_plan.cadence_after_72h,
+                        cap=reduction_plan.cap_samples_per_fire,
+                        sample_hours_utc=sample_hours,
+                        max_hours_per_fire=max_hours_per_fire,
+                    )
+                )
 
-            for run_time in _iter_fire_hours(
-                rec,
-                cadence_after_72h=reduction_plan.cadence_after_72h,
-                cap=reduction_plan.cap_samples_per_fire,
-                sample_hours_utc=sample_hours,
-                max_hours_per_fire=max_hours_per_fire,
-            ):
+            for sample_day, run_time in sample_iterator:
                 if max_samples_total is not None and sample_count >= int(max_samples_total):
                     break
-                input_patches: dict[str, np.ndarray] = {}
-                label_patches: dict[int, np.ndarray] = {}
+
+                if daily_aggregate:
+                    source_times = [_utc_datetime(sample_day, hour) for hour in sorted(sample_hours)]
+                    label_times_by_lead = {
+                        24: [_utc_datetime(sample_day + timedelta(days=1), hour) for hour in sorted(sample_hours)]
+                    }
+                else:
+                    source_times = [run_time]
+                    label_times_by_lead = {
+                        lead: [run_time + timedelta(hours=lead)]
+                        for lead in leads
+                    }
+
+                input_hourly: dict[str, list[np.ndarray]] = {config.wildfire.frp_channel_name: []}
+                for channel_name in hrrr_channels:
+                    input_hourly[channel_name] = []
+                label_hourly: dict[int, list[np.ndarray]] = {lead: [] for lead in leads}
 
                 missing = False
-                frp_patch = viirs_rasterizer.patch_for_hour(
-                    run_time_utc=run_time,
-                    bounds_xy=bounds_xy,
-                    patch_size=patch_size,
-                )
-                input_patches[config.wildfire.frp_channel_name] = frp_patch
+
+                for ts in source_times:
+                    frp_patch = viirs_rasterizer.patch_for_hour(
+                        run_time_utc=ts,
+                        bounds_xy=bounds_xy,
+                        patch_size=patch_size,
+                    )
+                    input_hourly[config.wildfire.frp_channel_name].append(frp_patch)
 
                 if worker_count == 1:
                     for spec, channel_name in zip(active_specs, hrrr_channels):
-                        patch = _extract_patch(
-                            reader,
-                            run_time_utc=run_time,
-                            spec=spec,
-                            bounds_xy=bounds_xy,
-                            patch_size=patch_size,
-                        )
-                        if patch is None:
-                            missing = True
+                        for ts in source_times:
+                            patch = _extract_patch(
+                                reader,
+                                run_time_utc=ts,
+                                spec=spec,
+                                bounds_xy=bounds_xy,
+                                patch_size=patch_size,
+                            )
+                            if patch is None:
+                                missing = True
+                                break
+                            input_hourly[channel_name].append(patch)
+                        if missing:
                             break
-                        input_patches[channel_name] = patch
 
                     if missing:
                         continue
 
-                    for lead in leads:
-                        label_time = run_time + timedelta(hours=lead)
-                        patch = _extract_patch(
-                            reader,
-                            run_time_utc=label_time,
-                            spec=config.wildfire.label_variable,
-                            bounds_xy=bounds_xy,
-                            patch_size=patch_size,
-                        )
-                        if patch is None:
-                            missing = True
+                    for lead, label_times in label_times_by_lead.items():
+                        for ts in label_times:
+                            patch = _extract_patch(
+                                reader,
+                                run_time_utc=ts,
+                                spec=config.wildfire.label_variable,
+                                bounds_xy=bounds_xy,
+                                patch_size=patch_size,
+                            )
+                            if patch is None:
+                                missing = True
+                                break
+                            label_hourly[lead].append(patch)
+                        if missing:
                             break
-                        label_patches[lead] = patch
                 else:
                     futures = {}
                     for spec, channel_name in zip(active_specs, hrrr_channels):
-                        fut = pool.submit(
-                            _extract_patch_threaded,
-                            config,
-                            run_time,
-                            spec,
-                            bounds_xy,
-                            patch_size,
-                        )
-                        futures[fut] = ("input", channel_name)
+                        for ts in source_times:
+                            fut = pool.submit(
+                                _extract_patch_threaded,
+                                config,
+                                ts,
+                                spec,
+                                bounds_xy,
+                                patch_size,
+                            )
+                            futures[fut] = ("input", channel_name)
 
-                    for lead in leads:
-                        label_time = run_time + timedelta(hours=lead)
-                        fut = pool.submit(
-                            _extract_patch_threaded,
-                            config,
-                            label_time,
-                            config.wildfire.label_variable,
-                            bounds_xy,
-                            patch_size,
-                        )
-                        futures[fut] = ("label", lead)
+                    for lead, label_times in label_times_by_lead.items():
+                        for ts in label_times:
+                            fut = pool.submit(
+                                _extract_patch_threaded,
+                                config,
+                                ts,
+                                config.wildfire.label_variable,
+                                bounds_xy,
+                                patch_size,
+                            )
+                            futures[fut] = ("label", lead)
 
                     for fut in as_completed(futures):
                         kind, key = futures[fut]
@@ -538,12 +741,21 @@ def run(
                             missing = True
                             break
                         if kind == "input":
-                            input_patches[str(key)] = patch
+                            input_hourly[str(key)].append(patch)
                         else:
-                            label_patches[int(key)] = patch
+                            label_hourly[int(key)].append(patch)
 
                 if missing:
                     continue
+
+                expected_input_count = len(source_times)
+                if any(len(v) != expected_input_count for v in input_hourly.values()):
+                    continue
+                if any(len(label_hourly[lead]) != len(label_times_by_lead[lead]) for lead in leads):
+                    continue
+
+                input_patches = {channel: _mean_patches(patches) for channel, patches in input_hourly.items()}
+                label_patches = {lead: _mean_patches(patches) for lead, patches in label_hourly.items()}
 
                 write_idx: int | None = None
                 for channel in channels:
@@ -567,7 +779,7 @@ def run(
                         input_patches[config.wildfire.frp_channel_name],
                     )
 
-                split = split_for_date(run_time.date(), config.split)
+                split = split_for_date(sample_day, config.split)
                 massden_patch = input_patches.get("MASSDEN_8m")
                 ugrd10_patch = input_patches.get("UGRD_10m")
                 vgrd10_patch = input_patches.get("VGRD_10m")
@@ -595,7 +807,9 @@ def run(
                         "incident_name": rec.incident_name,
                         "state": rec.state,
                         "run_time_utc": run_time.isoformat(),
-                        "run_date": run_time.date().isoformat(),
+                        "run_date": sample_day.isoformat(),
+                        "aggregation_mode": "daily_4h_mean" if daily_aggregate else "hourly",
+                        "source_hours_utc": ",".join(str(h) for h in sorted(sample_hours)) if daily_aggregate else str(run_time.hour),
                         "bbox_min_lon": rec.min_lon,
                         "bbox_min_lat": rec.min_lat,
                         "bbox_max_lon": rec.max_lon,
@@ -649,6 +863,7 @@ def run(
         "budget_bytes": int(config.storage.budget_gb * (1024**3)),
         "sample_hours_utc": sorted(sample_hours) if sample_hours is not None else "all",
         "next_day_only": bool(next_day_only),
+        "daily_aggregate": bool(daily_aggregate),
         "reduction_actions": reduction_plan.actions,
         "reduction_plan": {
             "include_upper_air": reduction_plan.include_upper_air,
