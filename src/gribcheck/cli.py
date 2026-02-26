@@ -86,6 +86,18 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Aggregate selected source hours into one daily sample (labels follow selected target mode).",
     )
+    wildfire_parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Resume from existing wildfire outputs (use --no-resume to rebuild from scratch).",
+    )
+    wildfire_parser.add_argument(
+        "--checkpoint-flush-samples",
+        type=int,
+        default=1,
+        help="Flush wildfire sample index checkpoint every N new samples.",
+    )
 
     return parser
 
@@ -151,6 +163,8 @@ def main() -> None:
             sample_hours_utc=_parse_hours_csv(args.sample_hours_utc),
             next_day_only=bool(args.next_day_only),
             daily_aggregate=bool(args.daily_aggregate),
+            resume=bool(args.resume),
+            checkpoint_flush_samples=args.checkpoint_flush_samples,
         )
         print(stats)
         return
