@@ -1,0 +1,48 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gribcheck"
+version = "0.1.0"
+description = "HRRR smoke + PM2.5 integration and wildfire raster dataset pipelines"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "dask[array]>=2024.8.0",
+  "fsspec>=2024.6.0",
+  "ijson>=3.3.0",
+  "numcodecs>=0.13.0",
+  "numpy>=2.0.0",
+  "orjson>=3.10.0",
+  "pandas>=2.2.0",
+  "pyarrow>=17.0.0",
+  "pyproj>=3.6.0",
+  "pyyaml>=6.0.2",
+  "s3fs>=2024.6.0",
+  "scipy>=1.14.0",
+  "shapely>=2.0.0",
+  "timezonefinder>=6.5.0",
+  "tqdm>=4.66.0",
+  "xarray>=2024.7.0",
+  "zarr>=2.18.0,<3",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.2.0",
+  "matplotlib>=3.9.0",
+]
+
+[project.scripts]
+gribcheck = "gribcheck.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+addopts = "-q"

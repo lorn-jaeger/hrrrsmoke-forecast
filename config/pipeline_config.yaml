@@ -1,0 +1,104 @@
+run:
+  start_date: "2021-01-01"
+  end_date: "2025-10-31"
+
+paths:
+  downloads_dir: "/Users/lorn/Downloads"
+  wildfire_perimeter_geojson: "/Users/lorn/Downloads/WFIGS_Interagency_Perimeters_6781836551080060975.geojson"
+  intermediate_dir: "/Users/lorn/Code/gribcheck/data/intermediate"
+  processed_dir: "/Users/lorn/Code/gribcheck/data/processed"
+  reports_dir: "/Users/lorn/Code/gribcheck/reports"
+  figures_dir: "/Users/lorn/Code/gribcheck/reports/figures"
+  qa_tiff_dir: "/Users/lorn/Code/gribcheck/data/qa_tiffs"
+  pm_output: "/Users/lorn/Code/gribcheck/data/intermediate/pm25_daily_clean.parquet"
+  station_daily_output: "/Users/lorn/Code/gribcheck/data/processed/pm25_hrrr_daily_joined.parquet"
+  accuracy_summary_output: "/Users/lorn/Code/gribcheck/data/processed/accuracy_summary.parquet"
+  accuracy_report_output: "/Users/lorn/Code/gribcheck/reports/accuracy_report.md"
+  wildfire_zarr_output: "/Users/lorn/Code/gribcheck/data/processed/wildfire_massden_forecast.zarr"
+  wildfire_index_output: "/Users/lorn/Code/gribcheck/data/processed/wildfire_massden_forecast_index.parquet"
+  dataset_build_log_output: "/Users/lorn/Code/gribcheck/data/processed/dataset_build_log.json"
+
+pm:
+  code_primary: "88101"
+  code_fallback: "88502"
+  file_glob_primary: "daily_88101_*.zip"
+  file_glob_fallback: "daily_88502_*.zip"
+
+hrrr:
+  bucket: "hrrrzarr"
+  product: "sfc"
+  anonymous: true
+  station_variables:
+    - variable: "MASSDEN"
+      level: "8m_above_ground"
+      output_column: "massden_daily_mean"
+    - variable: "COLMD"
+      level: "entire_atmosphere_single_layer"
+      output_column: "colmd_daily_mean"
+
+viirs:
+  file_glob: "DL_FIRE_J1*.zip"
+  cache_parquet: "/Users/lorn/Code/gribcheck/data/intermediate/viirs_frp_hourly_points.parquet"
+
+wildfire:
+  incident_type: "WF"
+  min_size_acres: 50.0
+  buffer_km: 30.0
+  patch_size: [256, 256]
+  frp_channel_name: "VIIRS_FRP_1h"
+  analysis_variables:
+    - variable: "MASSDEN"
+      level: "8m_above_ground"
+      channel_name: "MASSDEN_8m"
+    - variable: "COLMD"
+      level: "entire_atmosphere_single_layer"
+      channel_name: "COLMD_entire_atmosphere_single_layer"
+    - variable: "UGRD"
+      level: "10m_above_ground"
+      channel_name: "UGRD_10m"
+    - variable: "VGRD"
+      level: "10m_above_ground"
+      channel_name: "VGRD_10m"
+    - variable: "UGRD"
+      level: "850mb"
+      channel_name: "UGRD_850mb"
+    - variable: "VGRD"
+      level: "850mb"
+      channel_name: "VGRD_850mb"
+    - variable: "DZDT"
+      level: "700mb"
+      channel_name: "DZDT_700mb"
+    - variable: "HPBL"
+      level: "surface"
+      channel_name: "HPBL_surface"
+    - variable: "PRATE"
+      level: "surface"
+      channel_name: "PRATE_surface"
+    - variable: "TMP"
+      level: "2m_above_ground"
+      channel_name: "TMP_2m"
+    - variable: "RH"
+      level: "2m_above_ground"
+      channel_name: "RH_2m"
+  label_variable:
+    variable: "MASSDEN"
+    level: "8m_above_ground"
+    lead_hours: [12, 24]
+
+storage:
+  budget_gb: 180.0
+  dtype: "float16"
+  compressor: "zstd"
+  projection_check_interval: 10000
+  reduction_order:
+    drop_upper_air_and_dzdt: true
+    two_hour_cadence_after_72h: true
+    cap_samples_per_fire: 240
+
+split:
+  train_start: "2021-01-01"
+  train_end: "2023-12-31"
+  val_start: "2024-01-01"
+  val_end: "2024-12-31"
+  test_start: "2025-01-01"
+  test_end: "2025-10-31"

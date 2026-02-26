@@ -1,0 +1,22 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+
+# Large data artifacts
+*.grib2
+*.idx
+output.txt
+
+# Pipeline outputs
+data/
+reports/figures/
+*.parquet
+*.zarr/
+*.json
+
+# macOS
+.DS_Store
