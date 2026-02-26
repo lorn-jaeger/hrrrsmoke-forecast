@@ -18,6 +18,8 @@ def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[s
             "pearson_r": float("nan"),
             "spearman_r": float("nan"),
             "r2": float("nan"),
+            "slope": float("nan"),
+            "intercept": float("nan"),
         }
 
     diff = y_pred - y_true
@@ -41,6 +43,14 @@ def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[s
     sst = float(np.sum((y_true - np.mean(y_true)) ** 2))
     sse = float(np.sum((y_true - y_pred) ** 2))
     r2 = float("nan") if sst < EPS else float(1.0 - sse / sst)
+    if sst < EPS:
+        slope = float("nan")
+        intercept = float("nan")
+    else:
+        x_mean = float(np.mean(y_true))
+        y_mean = float(np.mean(y_pred))
+        slope = float(np.sum((y_true - x_mean) * (y_pred - y_mean)) / np.sum((y_true - x_mean) ** 2))
+        intercept = float(y_mean - slope * x_mean)
 
     return {
         "mae": mae,
@@ -49,4 +59,6 @@ def compute_regression_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> dict[s
         "pearson_r": pearson,
         "spearman_r": spearman,
         "r2": r2,
+        "slope": slope,
+        "intercept": intercept,
     }

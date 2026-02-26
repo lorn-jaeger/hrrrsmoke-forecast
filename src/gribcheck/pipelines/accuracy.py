@@ -5,6 +5,7 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from textwrap import dedent
 
 import numpy as np
 import pandas as pd
@@ -148,7 +149,106 @@ def _build_summary(df: pd.DataFrame, predictors: list[str], workers: int) -> pd.
     return out
 
 
-def _write_report(summary: pd.DataFrame, output_path: Path) -> None:
+def _quantiles(values: np.ndarray, probs: list[float]) -> list[float]:
+    if values.size == 0:
+        return [float("nan")] * len(probs)
+    return [float(v) for v in np.quantile(values, probs)]
+
+
+def _distribution_row(y_true: np.ndarray, y_pred: np.ndarray, predictor: str) -> dict[str, object]:
+    residual = y_pred - y_true
+    true_q = _quantiles(y_true, [0.5, 0.9, 0.95, 0.99])
+    pred_q = _quantiles(y_pred, [0.5, 0.9, 0.95, 0.99])
+    res_q = _quantiles(residual, [0.5, 0.9, 0.95, 0.99])
+
+    return {
+        "predictor": predictor,
+        "n": int(y_true.size),
+        "pm25_mean": float(np.mean(y_true)) if y_true.size else float("nan"),
+        "pm25_std": float(np.std(y_true)) if y_true.size else float("nan"),
+        "pm25_p50": true_q[0],
+        "pm25_p90": true_q[1],
+        "pm25_p95": true_q[2],
+        "pm25_p99": true_q[3],
+        "pred_mean": float(np.mean(y_pred)) if y_pred.size else float("nan"),
+        "pred_std": float(np.std(y_pred)) if y_pred.size else float("nan"),
+        "pred_p50": pred_q[0],
+        "pred_p90": pred_q[1],
+        "pred_p95": pred_q[2],
+        "pred_p99": pred_q[3],
+        "residual_mean": float(np.mean(residual)) if residual.size else float("nan"),
+        "residual_std": float(np.std(residual)) if residual.size else float("nan"),
+        "residual_p50": res_q[0],
+        "residual_p90": res_q[1],
+        "residual_p95": res_q[2],
+        "residual_p99": res_q[3],
+        "pm25_over_35_frac": float(np.mean(y_true > 35.0)) if y_true.size else float("nan"),
+        "pred_over_35_frac": float(np.mean(y_pred > 35.0)) if y_pred.size else float("nan"),
+        "pm25_over_55_frac": float(np.mean(y_true > 55.0)) if y_true.size else float("nan"),
+        "pred_over_55_frac": float(np.mean(y_pred > 55.0)) if y_pred.size else float("nan"),
+    }
+
+
+def _overall_metrics_with_logs(df: pd.DataFrame, predictors: list[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    metrics_rows: list[dict[str, object]] = []
+    distribution_rows: list[dict[str, object]] = []
+
+    for predictor in predictors:
+        subset = df[["pm25_value", predictor]].dropna()
+        y_true = subset["pm25_value"].to_numpy(dtype=np.float64)
+        y_pred = subset[predictor].to_numpy(dtype=np.float64)
+
+        raw_metrics = compute_regression_metrics(y_true=y_true, y_pred=y_pred)
+        metrics_rows.append(
+            {
+                "predictor": predictor,
+                "transform": "raw",
+                "n": int(y_true.size),
+                **raw_metrics,
+            }
+        )
+        distribution_rows.append(_distribution_row(y_true=y_true, y_pred=y_pred, predictor=predictor))
+
+        valid_log = (y_true > -0.999999) & (y_pred > -0.999999)
+        y_true_log = np.log1p(y_true[valid_log])
+        y_pred_log = np.log1p(y_pred[valid_log])
+        log_metrics = compute_regression_metrics(y_true=y_true_log, y_pred=y_pred_log)
+        metrics_rows.append(
+            {
+                "predictor": predictor,
+                "transform": "log1p",
+                "n": int(y_true_log.size),
+                **log_metrics,
+            }
+        )
+
+    metrics_df = pd.DataFrame(metrics_rows).sort_values(["predictor", "transform"]).reset_index(drop=True)
+    dist_df = pd.DataFrame(distribution_rows).sort_values(["predictor"]).reset_index(drop=True)
+    return metrics_df, dist_df
+
+
+def _console_overall_block(overall_metrics: pd.DataFrame, distribution: pd.DataFrame) -> str:
+    lines: list[str] = []
+    lines.append("=== Accuracy Full-Set Metrics ===")
+    for _, row in overall_metrics.iterrows():
+        lines.append(
+            f"{row['predictor']} [{row['transform']}]: n={int(row['n'])}, RMSE={row['rmse']:.4f}, "
+            f"Spearman={row['spearman_r']:.4f}, slope={row['slope']:.4f}, "
+            f"MAE={row['mae']:.4f}, bias={row['bias']:.4f}, R2={row['r2']:.4f}"
+        )
+
+    lines.append("=== Distribution Diagnostics (raw) ===")
+    for _, row in distribution.iterrows():
+        lines.append(
+            f"{row['predictor']}: pm25 p50/p95/p99={row['pm25_p50']:.2f}/{row['pm25_p95']:.2f}/{row['pm25_p99']:.2f}, "
+            f"pred p50/p95/p99={row['pred_p50']:.2f}/{row['pred_p95']:.2f}/{row['pred_p99']:.2f}, "
+            f"residual mean/std={row['residual_mean']:.2f}/{row['residual_std']:.2f}, "
+            f"pm25>35={row['pm25_over_35_frac']:.3f}, pred>35={row['pred_over_35_frac']:.3f}"
+        )
+    return "\n".join(lines)
+
+
+def _write_report(summary: pd.DataFrame, overall_metrics: pd.DataFrame, distribution: pd.DataFrame, output_path: Path) -> None:
     lines: list[str] = []
     lines.append("# HRRR vs PM2.5 Accuracy Report")
     lines.append("")
@@ -159,7 +259,30 @@ def _write_report(summary: pd.DataFrame, output_path: Path) -> None:
     for _, row in overall.iterrows():
         lines.append(
             f"- `{row['predictor']}`: n={int(row['n'])}, MAE={row['mae']:.4f}, RMSE={row['rmse']:.4f}, "
-            f"Bias={row['bias']:.4f}, Pearson r={row['pearson_r']:.4f}, Spearman r={row['spearman_r']:.4f}, R²={row['r2']:.4f}"
+            f"Bias={row['bias']:.4f}, Pearson r={row['pearson_r']:.4f}, Spearman r={row['spearman_r']:.4f}, "
+            f"Slope={row['slope']:.4f}, R²={row['r2']:.4f}"
+        )
+
+    lines.append("")
+    lines.append("## Full-Set Raw And Log1p")
+    lines.append("")
+    for _, row in overall_metrics.iterrows():
+        lines.append(
+            f"- `{row['predictor']}` [{row['transform']}]: n={int(row['n'])}, RMSE={row['rmse']:.4f}, "
+            f"Spearman r={row['spearman_r']:.4f}, Slope={row['slope']:.4f}, "
+            f"MAE={row['mae']:.4f}, Bias={row['bias']:.4f}, R²={row['r2']:.4f}"
+        )
+
+    lines.append("")
+    lines.append("## Distribution Diagnostics")
+    lines.append("")
+    for _, row in distribution.iterrows():
+        lines.append(
+            f"- `{row['predictor']}`: pm25 p50/p95/p99={row['pm25_p50']:.2f}/{row['pm25_p95']:.2f}/{row['pm25_p99']:.2f}, "
+            f"pred p50/p95/p99={row['pred_p50']:.2f}/{row['pred_p95']:.2f}/{row['pred_p99']:.2f}, "
+            f"residual mean/std={row['residual_mean']:.2f}/{row['residual_std']:.2f}, "
+            f"pm25>35={row['pm25_over_35_frac']:.3f}, pred>35={row['pred_over_35_frac']:.3f}, "
+            f"pm25>55={row['pm25_over_55_frac']:.3f}, pred>55={row['pred_over_55_frac']:.3f}"
         )
 
     lines.append("")
@@ -237,12 +360,21 @@ def run(
 
     predictors = ["massden_daily_mean", "colmd_daily_mean"]
     summary = _build_summary(df, predictors=predictors, workers=worker_count)
+    overall_metrics, distribution = _overall_metrics_with_logs(df, predictors=predictors)
 
     config.paths.accuracy_summary_output.parent.mkdir(parents=True, exist_ok=True)
     summary.to_parquet(config.paths.accuracy_summary_output, index=False)
+    overall_path = config.paths.processed_dir / "accuracy_overall_metrics.parquet"
+    distribution_path = config.paths.processed_dir / "accuracy_distribution.parquet"
+    overall_metrics.to_parquet(overall_path, index=False)
+    distribution.to_parquet(distribution_path, index=False)
 
-    _write_report(summary, config.paths.accuracy_report_output)
+    _write_report(summary, overall_metrics, distribution, config.paths.accuracy_report_output)
     _maybe_make_plots(df, predictors=predictors, out_dir=config.paths.figures_dir)
+
+    console_block = _console_overall_block(overall_metrics, distribution)
+    print(dedent(console_block))
+    LOGGER.info("Wrote overall metrics to %s and distribution diagnostics to %s", overall_path, distribution_path)
 
     LOGGER.info("Accuracy evaluation complete: %d summary rows", len(summary))
     return AccuracyStats(evaluated_rows=len(df), summary_rows=len(summary))
