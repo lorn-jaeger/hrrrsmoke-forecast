@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
+from threading import local
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -15,6 +18,7 @@ from gribcheck.geo_utils import hrrr_transformer_to_xy
 from gribcheck.hrrr import HRRRAnalysisReader
 
 LOGGER = logging.getLogger(__name__)
+_THREAD_LOCAL = local()
 
 
 @dataclass(frozen=True)
@@ -22,6 +26,13 @@ class StationDailyStats:
     station_count: int
     hour_count_attempted: int
     joined_rows: int
+
+
+def _default_workers(workers: int | None) -> int:
+    if workers is not None:
+        return max(1, int(workers))
+    cpu_count = os.cpu_count() or 2
+    return max(1, min(4, cpu_count))
 
 
 def _expected_hours_for_local_day(local_day: datetime.date, tz_name: str) -> int:
@@ -50,10 +61,77 @@ def _utc_hour_range(start_date, end_date) -> pd.DatetimeIndex:
     return pd.date_range(start=start_utc, end=end_utc, freq="1h", tz="UTC")
 
 
+def _thread_reader(config: PipelineConfig) -> HRRRAnalysisReader:
+    reader = getattr(_THREAD_LOCAL, "hrrr_reader", None)
+    if reader is None:
+        reader = HRRRAnalysisReader(config.hrrr)
+        _THREAD_LOCAL.hrrr_reader = reader
+    return reader
+
+
+def _sample_two_fields(
+    reader: HRRRAnalysisReader,
+    run_time_utc: datetime,
+    variable_specs,
+    x_points: np.ndarray,
+    y_points: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    sampled_vars: list[np.ndarray] = []
+    for spec in variable_specs:
+        da = reader.load_field(run_time_utc, spec)
+        if da is None:
+            return None
+        sampled = reader.bilinear_sample(da, x_points=x_points, y_points=y_points)
+        sampled_vars.append(sampled)
+    return sampled_vars[0], sampled_vars[1]
+
+
+def _sample_two_fields_threaded(
+    config: PipelineConfig,
+    run_time_utc: datetime,
+    variable_specs,
+    x_points: np.ndarray,
+    y_points: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    reader = _thread_reader(config)
+    return _sample_two_fields(
+        reader=reader,
+        run_time_utc=run_time_utc,
+        variable_specs=variable_specs,
+        x_points=x_points,
+        y_points=y_points,
+    )
+
+
+def _accumulate_hour(
+    agg: dict[tuple[str, datetime.date], list[float]],
+    station_ids: np.ndarray,
+    by_tz: dict[str, np.ndarray],
+    tz_cache: dict[str, ZoneInfo],
+    utc_hour: datetime,
+    sampled_0: np.ndarray,
+    sampled_1: np.ndarray,
+) -> None:
+    valid_mask = np.isfinite(sampled_0) & np.isfinite(sampled_1)
+
+    for tz_name, idxs in by_tz.items():
+        if len(idxs) == 0:
+            continue
+        local_day = utc_hour.astimezone(tz_cache[tz_name]).date()
+        valid_idxs = idxs[valid_mask[idxs]]
+        for idx in valid_idxs:
+            key = (station_ids[idx], local_day)
+            rec = agg[key]
+            rec[0] += float(sampled_0[idx])
+            rec[1] += float(sampled_1[idx])
+            rec[2] += 1.0
+
+
 def run(
     config: PipelineConfig,
     max_hours: int | None = None,
     station_limit: int | None = None,
+    workers: int | None = None,
 ) -> StationDailyStats:
     pm_df = pd.read_parquet(config.paths.pm_output)
     if pm_df.empty:
@@ -76,15 +154,16 @@ def run(
     stations["x"] = x_vals
     stations["y"] = y_vals
 
-    reader = HRRRAnalysisReader(config.hrrr)
     utc_hours = _utc_hour_range(config.run.start_date, config.run.end_date)
     if max_hours is not None:
         utc_hours = utc_hours[: int(max_hours)]
+    worker_count = _default_workers(workers)
 
     by_tz: dict[str, np.ndarray] = {}
     tz_arr = stations["timezone"].to_numpy()
     for tz_name in sorted(set(tz_arr)):
         by_tz[tz_name] = np.where(tz_arr == tz_name)[0]
+    tz_cache = {tz_name: ZoneInfo(tz_name) for tz_name in by_tz}
 
     station_ids = stations["station_id"].to_numpy()
     x_points = stations["x"].to_numpy(dtype=np.float64)
@@ -99,39 +178,88 @@ def run(
     # key -> [sum_var0, sum_var1, hour_count]
     agg: dict[tuple[str, datetime.date], list[float]] = defaultdict(lambda: [0.0, 0.0, 0.0])
 
-    LOGGER.info("Sampling %d UTC hours for %d stations", len(utc_hours), len(stations))
+    LOGGER.info(
+        "Sampling %d UTC hours for %d stations using %d worker(s)",
+        len(utc_hours),
+        len(stations),
+        worker_count,
+    )
 
-    for i, utc_hour in enumerate(utc_hours):
-        if i % 200 == 0:
-            LOGGER.info("Processing hour %d / %d (%s)", i + 1, len(utc_hours), utc_hour)
+    total_hours = len(utc_hours)
+    processed_hours = 0
 
-        sampled_vars: list[np.ndarray] = []
-        missing_field = False
-        for spec in variable_specs:
-            da = reader.load_field(utc_hour.to_pydatetime(), spec)
-            if da is None:
-                missing_field = True
-                break
-            sampled = reader.bilinear_sample(da, x_points=x_points, y_points=y_points)
-            sampled_vars.append(sampled)
+    if worker_count == 1:
+        reader = HRRRAnalysisReader(config.hrrr)
+        for utc_hour in utc_hours:
+            sampled = _sample_two_fields(
+                reader=reader,
+                run_time_utc=utc_hour.to_pydatetime(),
+                variable_specs=variable_specs,
+                x_points=x_points,
+                y_points=y_points,
+            )
+            if sampled is not None:
+                _accumulate_hour(
+                    agg=agg,
+                    station_ids=station_ids,
+                    by_tz=by_tz,
+                    tz_cache=tz_cache,
+                    utc_hour=utc_hour.to_pydatetime(),
+                    sampled_0=sampled[0],
+                    sampled_1=sampled[1],
+                )
+            processed_hours += 1
+            LOGGER.info("Processed hour %d / %d (%s)", processed_hours, total_hours, utc_hour)
+    else:
+        max_in_flight = max(worker_count * 4, worker_count)
+        submitted = 0
+        in_flight = {}
+        hour_list = list(utc_hours)
 
-        if missing_field:
-            continue
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            while submitted < len(hour_list) and len(in_flight) < max_in_flight:
+                utc_hour = hour_list[submitted]
+                fut = pool.submit(
+                    _sample_two_fields_threaded,
+                    config,
+                    utc_hour.to_pydatetime(),
+                    variable_specs,
+                    x_points,
+                    y_points,
+                )
+                in_flight[fut] = utc_hour
+                submitted += 1
 
-        valid_mask = np.isfinite(sampled_vars[0]) & np.isfinite(sampled_vars[1])
+            while in_flight:
+                done, _pending = wait(in_flight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    utc_hour = in_flight.pop(fut)
+                    sampled = fut.result()
+                    if sampled is not None:
+                        _accumulate_hour(
+                            agg=agg,
+                            station_ids=station_ids,
+                            by_tz=by_tz,
+                            tz_cache=tz_cache,
+                            utc_hour=utc_hour.to_pydatetime(),
+                            sampled_0=sampled[0],
+                            sampled_1=sampled[1],
+                        )
+                    processed_hours += 1
+                    LOGGER.info("Processed hour %d / %d (%s)", processed_hours, total_hours, utc_hour)
 
-        for tz_name, idxs in by_tz.items():
-            if len(idxs) == 0:
-                continue
-            local_day = utc_hour.to_pydatetime().astimezone(ZoneInfo(tz_name)).date()
-            for idx in idxs:
-                if not valid_mask[idx]:
-                    continue
-                key = (station_ids[idx], local_day)
-                rec = agg[key]
-                rec[0] += float(sampled_vars[0][idx])
-                rec[1] += float(sampled_vars[1][idx])
-                rec[2] += 1.0
+                    if submitted < len(hour_list):
+                        next_hour = hour_list[submitted]
+                        next_fut = pool.submit(
+                            _sample_two_fields_threaded,
+                            config,
+                            next_hour.to_pydatetime(),
+                            variable_specs,
+                            x_points,
+                            y_points,
+                        )
+                        in_flight[next_fut] = next_hour
+                        submitted += 1
 
     rows: list[dict[str, object]] = []
     for (station_id, local_day), (sum0, sum1, count) in agg.items():

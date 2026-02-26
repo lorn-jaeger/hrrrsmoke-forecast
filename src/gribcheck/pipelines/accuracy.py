@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -88,6 +90,13 @@ class AccuracyStats:
     summary_rows: int
 
 
+def _default_workers(workers: int | None) -> int:
+    if workers is not None:
+        return max(1, int(workers))
+    cpu_count = os.cpu_count() or 2
+    return max(1, min(4, cpu_count))
+
+
 def _summarize_group(df: pd.DataFrame, group_name: str, group_value: str, predictor_col: str) -> dict[str, object]:
     subset = df[["pm25_value", predictor_col]].dropna()
     y_true = subset["pm25_value"].to_numpy(dtype=np.float64)
@@ -103,26 +112,36 @@ def _summarize_group(df: pd.DataFrame, group_name: str, group_value: str, predic
     }
 
 
-def _build_summary(df: pd.DataFrame, predictors: list[str]) -> pd.DataFrame:
-    rows: list[dict[str, object]] = []
+def _build_summary(df: pd.DataFrame, predictors: list[str], workers: int) -> pd.DataFrame:
+    tasks: list[tuple[pd.DataFrame, str, str, str]] = []
 
     for predictor in predictors:
-        rows.append(_summarize_group(df, "overall", "overall", predictor))
+        tasks.append((df, "overall", "overall", predictor))
 
         for year, group in df.groupby("year", dropna=True):
-            rows.append(_summarize_group(group, "year", str(int(year)), predictor))
+            tasks.append((group, "year", str(int(year)), predictor))
 
         for season, group in df.groupby("season", dropna=True):
-            rows.append(_summarize_group(group, "season", str(season), predictor))
+            tasks.append((group, "season", str(season), predictor))
 
         for state, group in df.groupby("state_name", dropna=True):
-            rows.append(_summarize_group(group, "state", str(state), predictor))
+            tasks.append((group, "state", str(state), predictor))
 
         for region, group in df.groupby("epa_region", dropna=True):
-            rows.append(_summarize_group(group, "epa_region", str(region), predictor))
+            tasks.append((group, "epa_region", str(region), predictor))
 
         for fire_bin, group in df.groupby("fire_proximity_bin", dropna=True):
-            rows.append(_summarize_group(group, "fire_proximity_bin", str(fire_bin), predictor))
+            tasks.append((group, "fire_proximity_bin", str(fire_bin), predictor))
+
+    if workers <= 1:
+        rows = [_summarize_group(group, gname, gval, pred) for group, gname, gval, pred in tasks]
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = [
+                pool.submit(_summarize_group, group, group_name, group_value, predictor)
+                for group, group_name, group_value, predictor in tasks
+            ]
+            rows = [f.result() for f in futures]
 
     out = pd.DataFrame(rows)
     out = out.sort_values(["predictor", "group_name", "group_value"]).reset_index(drop=True)
@@ -176,23 +195,24 @@ def _maybe_make_plots(df: pd.DataFrame, predictors: list[str], out_dir: Path) ->
         plt.close(fig)
 
 
-def run(config: PipelineConfig) -> AccuracyStats:
+def run(config: PipelineConfig, workers: int | None = None) -> AccuracyStats:
     df = pd.read_parquet(config.paths.station_daily_output)
     if df.empty:
         raise ValueError("Joined station dataset is empty; run build-station-hrrr-daily first")
+    worker_count = _default_workers(workers)
 
     df["date_local"] = pd.to_datetime(df["date_local"]).dt.date
     df["year"] = pd.to_datetime(df["date_local"]).dt.year
     df["season"] = df["date_local"].map(season_from_date)
     df["epa_region"] = df["state_name"].astype(str).map(EPA_REGION_BY_STATE_NAME).fillna("EPA-unknown")
 
-    LOGGER.info("Loading wildfire records for proximity bins")
+    LOGGER.info("Loading wildfire records for proximity bins with %d worker(s)", worker_count)
     fire_records = load_filtered_fire_records(config)
     daily_index = build_daily_fire_index(fire_records)
-    df["fire_proximity_bin"] = assign_fire_proximity_bins(df, daily_fires=daily_index)
+    df["fire_proximity_bin"] = assign_fire_proximity_bins(df, daily_fires=daily_index, workers=worker_count)
 
     predictors = ["massden_daily_mean", "colmd_daily_mean"]
-    summary = _build_summary(df, predictors=predictors)
+    summary = _build_summary(df, predictors=predictors, workers=worker_count)
 
     config.paths.accuracy_summary_output.parent.mkdir(parents=True, exist_ok=True)
     summary.to_parquet(config.paths.accuracy_summary_output, index=False)

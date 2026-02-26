@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import shutil
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import local
 
 import numcodecs
 import numpy as np
@@ -20,6 +24,7 @@ from gribcheck.models import FireRecord, VariableSpec
 from gribcheck.viirs import build_viirs_rasterizer, load_or_build_viirs_hourly_points
 
 LOGGER = logging.getLogger(__name__)
+_THREAD_LOCAL = local()
 
 
 @dataclass(frozen=True)
@@ -36,6 +41,13 @@ class ReductionPlan:
     cadence_after_72h: int
     cap_samples_per_fire: int | None
     actions: list[str]
+
+
+def _default_workers(workers: int | None) -> int:
+    if workers is not None:
+        return max(1, int(workers))
+    cpu_count = os.cpu_count() or 2
+    return max(1, min(4, cpu_count))
 
 
 def _floor_to_hour(value: datetime) -> datetime:
@@ -220,6 +232,25 @@ def _extract_patch(reader: HRRRAnalysisReader, run_time_utc: datetime, spec: Var
     return _resample_to_patch(subset, patch_size=patch_size)
 
 
+def _thread_reader(config: PipelineConfig) -> HRRRAnalysisReader:
+    reader = getattr(_THREAD_LOCAL, "hrrr_reader", None)
+    if reader is None:
+        reader = HRRRAnalysisReader(config.hrrr)
+        _THREAD_LOCAL.hrrr_reader = reader
+    return reader
+
+
+def _extract_patch_threaded(
+    config: PipelineConfig,
+    run_time_utc: datetime,
+    spec: VariableSpec,
+    bounds_xy,
+    patch_size,
+):
+    reader = _thread_reader(config)
+    return _extract_patch(reader, run_time_utc=run_time_utc, spec=spec, bounds_xy=bounds_xy, patch_size=patch_size)
+
+
 def _create_or_open_zarr(path: Path, channels: list[str], leads: list[int], patch_size: tuple[int, int], dtype: str, compressor: str):
     if path.exists():
         # Start fresh each run for deterministic output.
@@ -315,6 +346,7 @@ def run(
     max_fires: int | None = None,
     max_samples_total: int | None = None,
     max_hours_per_fire: int | None = None,
+    workers: int | None = None,
 ) -> WildfireRasterStats:
     records = load_filtered_fire_records(config)
     if not records:
@@ -332,6 +364,7 @@ def run(
     channels = [config.wildfire.frp_channel_name, *hrrr_channels]
     leads = sorted(config.wildfire.label_lead_hours)
     patch_size = tuple(config.wildfire.patch_size)
+    worker_count = _default_workers(workers)
 
     reader = HRRRAnalysisReader(config.hrrr)
     viirs_df = load_or_build_viirs_hourly_points(config)
@@ -352,131 +385,179 @@ def run(
     label_arrays = {lead: zarr_group[f"labels/t_plus_{lead}h"] for lead in leads}
 
     sample_count = 0
-    for fire_idx, rec in enumerate(records):
-        if fire_idx % 200 == 0:
-            LOGGER.info("Processing fire %d / %d", fire_idx + 1, len(records))
+    LOGGER.info(
+        "Building wildfire raster dataset with %d worker(s) for HRRR extraction",
+        worker_count,
+    )
 
-        bounds_xy = _build_bounds_xy(rec, buffer_km=config.wildfire.buffer_km)
+    with ThreadPoolExecutor(max_workers=worker_count) if worker_count > 1 else nullcontext() as pool:
+        for fire_idx, rec in enumerate(records):
+            if fire_idx % 200 == 0:
+                LOGGER.info("Processing fire %d / %d", fire_idx + 1, len(records))
 
-        for run_time in _iter_fire_hours(
-            rec,
-            cadence_after_72h=reduction_plan.cadence_after_72h,
-            cap=reduction_plan.cap_samples_per_fire,
-            max_hours_per_fire=max_hours_per_fire,
-        ):
-            if max_samples_total is not None and sample_count >= int(max_samples_total):
-                break
-            input_patches: dict[str, np.ndarray] = {}
-            label_patches: dict[int, np.ndarray] = {}
+            bounds_xy = _build_bounds_xy(rec, buffer_km=config.wildfire.buffer_km)
 
-            missing = False
-            frp_patch = viirs_rasterizer.patch_for_hour(
-                run_time_utc=run_time,
-                bounds_xy=bounds_xy,
-                patch_size=patch_size,
-            )
-            input_patches[config.wildfire.frp_channel_name] = frp_patch
-
-            for spec, channel_name in zip(active_specs, hrrr_channels):
-                patch = _extract_patch(reader, run_time_utc=run_time, spec=spec, bounds_xy=bounds_xy, patch_size=patch_size)
-                if patch is None:
-                    missing = True
+            for run_time in _iter_fire_hours(
+                rec,
+                cadence_after_72h=reduction_plan.cadence_after_72h,
+                cap=reduction_plan.cap_samples_per_fire,
+                max_hours_per_fire=max_hours_per_fire,
+            ):
+                if max_samples_total is not None and sample_count >= int(max_samples_total):
                     break
-                input_patches[channel_name] = patch
+                input_patches: dict[str, np.ndarray] = {}
+                label_patches: dict[int, np.ndarray] = {}
 
-            if missing:
-                continue
-
-            for lead in leads:
-                label_time = run_time + timedelta(hours=lead)
-                patch = _extract_patch(
-                    reader,
-                    run_time_utc=label_time,
-                    spec=config.wildfire.label_variable,
+                missing = False
+                frp_patch = viirs_rasterizer.patch_for_hour(
+                    run_time_utc=run_time,
                     bounds_xy=bounds_xy,
                     patch_size=patch_size,
                 )
-                if patch is None:
-                    missing = True
-                    break
-                label_patches[lead] = patch
+                input_patches[config.wildfire.frp_channel_name] = frp_patch
 
-            if missing:
-                continue
+                if worker_count == 1:
+                    for spec, channel_name in zip(active_specs, hrrr_channels):
+                        patch = _extract_patch(
+                            reader,
+                            run_time_utc=run_time,
+                            spec=spec,
+                            bounds_xy=bounds_xy,
+                            patch_size=patch_size,
+                        )
+                        if patch is None:
+                            missing = True
+                            break
+                        input_patches[channel_name] = patch
 
-            write_idx: int | None = None
-            for channel in channels:
-                idx = _append_2d(input_arrays[channel], input_patches[channel].astype(np.float16, copy=False))
-                if write_idx is None:
-                    write_idx = idx
+                    if missing:
+                        continue
 
-            assert write_idx is not None
+                    for lead in leads:
+                        label_time = run_time + timedelta(hours=lead)
+                        patch = _extract_patch(
+                            reader,
+                            run_time_utc=label_time,
+                            spec=config.wildfire.label_variable,
+                            bounds_xy=bounds_xy,
+                            patch_size=patch_size,
+                        )
+                        if patch is None:
+                            missing = True
+                            break
+                        label_patches[lead] = patch
+                else:
+                    futures = {}
+                    for spec, channel_name in zip(active_specs, hrrr_channels):
+                        fut = pool.submit(
+                            _extract_patch_threaded,
+                            config,
+                            run_time,
+                            spec,
+                            bounds_xy,
+                            patch_size,
+                        )
+                        futures[fut] = ("input", channel_name)
 
-            for lead in leads:
-                idx2 = _append_2d(label_arrays[lead], label_patches[lead].astype(np.float16, copy=False))
-                if idx2 != write_idx:
-                    raise RuntimeError("Label and input array index misalignment")
+                    for lead in leads:
+                        label_time = run_time + timedelta(hours=lead)
+                        fut = pool.submit(
+                            _extract_patch_threaded,
+                            config,
+                            label_time,
+                            config.wildfire.label_variable,
+                            bounds_xy,
+                            patch_size,
+                        )
+                        futures[fut] = ("label", lead)
 
-            if sample_count < 16:
-                config.paths.qa_tiff_dir.mkdir(parents=True, exist_ok=True)
-                _maybe_write_qa_tiff(
-                    config.paths.qa_tiff_dir,
-                    write_idx,
-                    config.wildfire.frp_channel_name,
-                    input_patches[config.wildfire.frp_channel_name],
+                    for fut in as_completed(futures):
+                        kind, key = futures[fut]
+                        patch = fut.result()
+                        if patch is None:
+                            missing = True
+                            break
+                        if kind == "input":
+                            input_patches[str(key)] = patch
+                        else:
+                            label_patches[int(key)] = patch
+
+                if missing:
+                    continue
+
+                write_idx: int | None = None
+                for channel in channels:
+                    idx = _append_2d(input_arrays[channel], input_patches[channel].astype(np.float16, copy=False))
+                    if write_idx is None:
+                        write_idx = idx
+
+                assert write_idx is not None
+
+                for lead in leads:
+                    idx2 = _append_2d(label_arrays[lead], label_patches[lead].astype(np.float16, copy=False))
+                    if idx2 != write_idx:
+                        raise RuntimeError("Label and input array index misalignment")
+
+                if sample_count < 16:
+                    config.paths.qa_tiff_dir.mkdir(parents=True, exist_ok=True)
+                    _maybe_write_qa_tiff(
+                        config.paths.qa_tiff_dir,
+                        write_idx,
+                        config.wildfire.frp_channel_name,
+                        input_patches[config.wildfire.frp_channel_name],
+                    )
+
+                split = split_for_date(run_time.date(), config.split)
+                massden_patch = input_patches.get("MASSDEN_8m")
+                ugrd10_patch = input_patches.get("UGRD_10m")
+                vgrd10_patch = input_patches.get("VGRD_10m")
+                persistence_mse_12 = np.nan
+                persistence_mse_24 = np.nan
+                advection_mse_12 = np.nan
+                advection_mse_24 = np.nan
+                if massden_patch is not None:
+                    if 12 in leads:
+                        persistence_mse_12 = float(np.nanmean((massden_patch - label_patches[12]) ** 2))
+                    if 24 in leads:
+                        persistence_mse_24 = float(np.nanmean((massden_patch - label_patches[24]) ** 2))
+                if massden_patch is not None and ugrd10_patch is not None and vgrd10_patch is not None:
+                    if 12 in leads:
+                        adv12 = _advection_baseline(massden_patch, ugrd10_patch, vgrd10_patch, lead_hours=12)
+                        advection_mse_12 = float(np.nanmean((adv12 - label_patches[12]) ** 2))
+                    if 24 in leads:
+                        adv24 = _advection_baseline(massden_patch, ugrd10_patch, vgrd10_patch, lead_hours=24)
+                        advection_mse_24 = float(np.nanmean((adv24 - label_patches[24]) ** 2))
+
+                index_rows.append(
+                    {
+                        "sample_id": int(write_idx),
+                        "fire_id": rec.unique_fire_id,
+                        "incident_name": rec.incident_name,
+                        "state": rec.state,
+                        "run_time_utc": run_time.isoformat(),
+                        "run_date": run_time.date().isoformat(),
+                        "bbox_min_lon": rec.min_lon,
+                        "bbox_min_lat": rec.min_lat,
+                        "bbox_max_lon": rec.max_lon,
+                        "bbox_max_lat": rec.max_lat,
+                        "size_acres": rec.size_acres,
+                        "split": split,
+                        "label_t_plus_12h_available": 12 in leads,
+                        "label_t_plus_24h_available": 24 in leads,
+                        "persistence_mse_t_plus_12h": persistence_mse_12,
+                        "persistence_mse_t_plus_24h": persistence_mse_24,
+                        "advection_mse_t_plus_12h": advection_mse_12,
+                        "advection_mse_t_plus_24h": advection_mse_24,
+                    }
                 )
 
-            split = split_for_date(run_time.date(), config.split)
-            massden_patch = input_patches.get("MASSDEN_8m")
-            ugrd10_patch = input_patches.get("UGRD_10m")
-            vgrd10_patch = input_patches.get("VGRD_10m")
-            persistence_mse_12 = np.nan
-            persistence_mse_24 = np.nan
-            advection_mse_12 = np.nan
-            advection_mse_24 = np.nan
-            if massden_patch is not None:
-                if 12 in leads:
-                    persistence_mse_12 = float(np.nanmean((massden_patch - label_patches[12]) ** 2))
-                if 24 in leads:
-                    persistence_mse_24 = float(np.nanmean((massden_patch - label_patches[24]) ** 2))
-            if massden_patch is not None and ugrd10_patch is not None and vgrd10_patch is not None:
-                if 12 in leads:
-                    adv12 = _advection_baseline(massden_patch, ugrd10_patch, vgrd10_patch, lead_hours=12)
-                    advection_mse_12 = float(np.nanmean((adv12 - label_patches[12]) ** 2))
-                if 24 in leads:
-                    adv24 = _advection_baseline(massden_patch, ugrd10_patch, vgrd10_patch, lead_hours=24)
-                    advection_mse_24 = float(np.nanmean((adv24 - label_patches[24]) ** 2))
+                sample_count += 1
 
-            index_rows.append(
-                {
-                    "sample_id": int(write_idx),
-                    "fire_id": rec.unique_fire_id,
-                    "incident_name": rec.incident_name,
-                    "state": rec.state,
-                    "run_time_utc": run_time.isoformat(),
-                    "run_date": run_time.date().isoformat(),
-                    "bbox_min_lon": rec.min_lon,
-                    "bbox_min_lat": rec.min_lat,
-                    "bbox_max_lon": rec.max_lon,
-                    "bbox_max_lat": rec.max_lat,
-                    "size_acres": rec.size_acres,
-                    "split": split,
-                    "label_t_plus_12h_available": 12 in leads,
-                    "label_t_plus_24h_available": 24 in leads,
-                    "persistence_mse_t_plus_12h": persistence_mse_12,
-                    "persistence_mse_t_plus_24h": persistence_mse_24,
-                    "advection_mse_t_plus_12h": advection_mse_12,
-                    "advection_mse_t_plus_24h": advection_mse_24,
-                }
-            )
+                if sample_count % config.storage.projection_check_interval == 0:
+                    LOGGER.info("Raster samples written: %d", sample_count)
 
-            sample_count += 1
-
-            if sample_count % config.storage.projection_check_interval == 0:
-                LOGGER.info("Raster samples written: %d", sample_count)
-
-        if max_samples_total is not None and sample_count >= int(max_samples_total):
-            break
+            if max_samples_total is not None and sample_count >= int(max_samples_total):
+                break
 
     index_df = pd.DataFrame(index_rows)
     config.paths.wildfire_index_output.parent.mkdir(parents=True, exist_ok=True)

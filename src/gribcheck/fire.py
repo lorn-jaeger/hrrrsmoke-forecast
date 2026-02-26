@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections import defaultdict
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -158,56 +160,104 @@ def build_daily_fire_index(records: list[FireRecord]) -> dict[date, list[FireRec
     return dict(index)
 
 
+def _default_workers(workers: int | None) -> int:
+    if workers is not None:
+        return max(1, int(workers))
+    cpu_count = os.cpu_count() or 2
+    return max(1, min(4, cpu_count))
+
+
+def _assign_day_bins(
+    local_day: date,
+    row_index: np.ndarray,
+    lat_arr: np.ndarray,
+    lon_arr: np.ndarray,
+    daily_fires: dict[date, list[FireRecord]],
+) -> tuple[np.ndarray, list[str]]:
+    fires = daily_fires.get(local_day, [])
+    if not fires:
+        return row_index, [">100"] * len(row_index)
+
+    centers = np.array([[rec.center_lat, rec.center_lon] for rec in fires], dtype=np.float64)
+    radii = np.array([bbox_radius_km((rec.min_lon, rec.min_lat, rec.max_lon, rec.max_lat)) for rec in fires])
+
+    # Use a fast nearest-neighbor prefilter, then exact haversine on few candidates.
+    lat0 = np.deg2rad(float(np.mean(centers[:, 0])))
+    scale_lon = np.cos(lat0)
+    centers_xy = np.column_stack((centers[:, 1] * scale_lon, centers[:, 0]))
+    station_xy = np.column_stack((lon_arr * scale_lon, lat_arr))
+    tree = cKDTree(centers_xy)
+    k = min(8, len(centers))
+    _distance, nn_idx = tree.query(station_xy, k=k)
+    nn_idx = np.atleast_2d(nn_idx)
+    if nn_idx.shape[0] != len(lat_arr):
+        nn_idx = nn_idx.T
+
+    day_bins: list[str] = []
+    for i, (lat, lon) in enumerate(zip(lat_arr, lon_arr)):
+        candidate_idx = np.atleast_1d(nn_idx[i]).astype(int)
+        c_subset = centers[candidate_idx]
+        r_subset = radii[candidate_idx]
+        center_dist = np.array([haversine_km(lat, lon, c_lat, c_lon) for c_lat, c_lon in c_subset])
+        perimeter_dist = np.maximum(center_dist - r_subset, 0.0)
+        min_dist = float(np.min(perimeter_dist))
+        if min_dist <= 30.0:
+            day_bins.append("<=30")
+        elif min_dist <= 100.0:
+            day_bins.append("30-100")
+        else:
+            day_bins.append(">100")
+    return row_index, day_bins
+
+
 def assign_fire_proximity_bins(
     df: pd.DataFrame,
     daily_fires: dict[date, list[FireRecord]],
     lat_col: str = "latitude",
     lon_col: str = "longitude",
     date_col: str = "date_local",
+    workers: int | None = None,
 ) -> pd.Series:
     out = pd.Series(index=df.index, dtype="object")
 
-    grouped = df.groupby(date_col, sort=False)
-    for local_day, day_df in grouped:
-        fires = daily_fires.get(local_day, [])
-        if not fires:
-            out.loc[day_df.index] = ">100"
-            continue
+    grouped_items: list[tuple[date, np.ndarray, np.ndarray, np.ndarray]] = []
+    for local_day, day_df in df.groupby(date_col, sort=False):
+        grouped_items.append(
+            (
+                local_day,
+                day_df.index.to_numpy(),
+                day_df[lat_col].to_numpy(dtype=np.float64),
+                day_df[lon_col].to_numpy(dtype=np.float64),
+            )
+        )
 
-        centers = np.array([[rec.center_lat, rec.center_lon] for rec in fires], dtype=np.float64)
-        radii = np.array([bbox_radius_km((rec.min_lon, rec.min_lat, rec.max_lon, rec.max_lat)) for rec in fires])
+    worker_count = _default_workers(workers)
+    if worker_count == 1:
+        for local_day, row_index, lat_arr, lon_arr in grouped_items:
+            idx, bins = _assign_day_bins(local_day, row_index, lat_arr, lon_arr, daily_fires)
+            out.loc[idx] = bins
+    else:
+        max_in_flight = max(worker_count * 4, worker_count)
+        submitted = 0
+        in_flight = {}
+        with ThreadPoolExecutor(max_workers=worker_count) as pool:
+            while submitted < len(grouped_items) and len(in_flight) < max_in_flight:
+                local_day, row_index, lat_arr, lon_arr = grouped_items[submitted]
+                fut = pool.submit(_assign_day_bins, local_day, row_index, lat_arr, lon_arr, daily_fires)
+                in_flight[fut] = local_day
+                submitted += 1
 
-        lat_arr = day_df[lat_col].to_numpy(dtype=np.float64)
-        lon_arr = day_df[lon_col].to_numpy(dtype=np.float64)
-
-        # Use a fast nearest-neighbor prefilter, then exact haversine on few candidates.
-        lat0 = np.deg2rad(float(np.mean(centers[:, 0])))
-        scale_lon = np.cos(lat0)
-        centers_xy = np.column_stack((centers[:, 1] * scale_lon, centers[:, 0]))
-        station_xy = np.column_stack((lon_arr * scale_lon, lat_arr))
-        tree = cKDTree(centers_xy)
-        k = min(8, len(centers))
-        _, nn_idx = tree.query(station_xy, k=k)
-        nn_idx = np.atleast_2d(nn_idx)
-        if nn_idx.shape[0] != len(lat_arr):
-            nn_idx = nn_idx.T
-
-        day_bins: list[str] = []
-        for i, (lat, lon) in enumerate(zip(lat_arr, lon_arr)):
-            candidate_idx = np.atleast_1d(nn_idx[i]).astype(int)
-            c_subset = centers[candidate_idx]
-            r_subset = radii[candidate_idx]
-            center_dist = np.array([haversine_km(lat, lon, c_lat, c_lon) for c_lat, c_lon in c_subset])
-            perimeter_dist = np.maximum(center_dist - r_subset, 0.0)
-            min_dist = float(np.min(perimeter_dist))
-            if min_dist <= 30.0:
-                day_bins.append("<=30")
-            elif min_dist <= 100.0:
-                day_bins.append("30-100")
-            else:
-                day_bins.append(">100")
-
-        out.loc[day_df.index] = day_bins
+            while in_flight:
+                done, _pending = wait(in_flight, return_when=FIRST_COMPLETED)
+                for fut in done:
+                    _local_day = in_flight.pop(fut)
+                    idx, bins = fut.result()
+                    out.loc[idx] = bins
+                    if submitted < len(grouped_items):
+                        local_day, row_index, lat_arr, lon_arr = grouped_items[submitted]
+                        next_fut = pool.submit(_assign_day_bins, local_day, row_index, lat_arr, lon_arr, daily_fires)
+                        in_flight[next_fut] = local_day
+                        submitted += 1
 
     out = out.fillna(">100")
     out.name = "fire_proximity_bin"

@@ -25,13 +25,16 @@ def _build_parser() -> argparse.ArgumentParser:
     station_parser = subparsers.add_parser("build-station-hrrr-daily", help="Build station-day HRRR + PM join")
     station_parser.add_argument("--max-hours", type=int, default=None, help="Optional cap on UTC hours processed")
     station_parser.add_argument("--station-limit", type=int, default=None, help="Optional cap on number of stations")
+    station_parser.add_argument("--workers", type=int, default=None, help="Thread worker count for hourly HRRR sampling")
 
-    subparsers.add_parser("evaluate-accuracy", help="Evaluate HRRR-vs-sensor accuracy")
+    accuracy_parser = subparsers.add_parser("evaluate-accuracy", help="Evaluate HRRR-vs-sensor accuracy")
+    accuracy_parser.add_argument("--workers", type=int, default=None, help="Thread worker count for grouping/proximity work")
 
     wildfire_parser = subparsers.add_parser("build-wildfire-raster-dataset", help="Build wildfire raster forecast dataset")
     wildfire_parser.add_argument("--max-fires", type=int, default=None, help="Optional cap on wildfire records")
     wildfire_parser.add_argument("--max-samples", type=int, default=None, help="Optional cap on total raster samples")
     wildfire_parser.add_argument("--max-hours-per-fire", type=int, default=None, help="Optional cap on scanned run hours per fire")
+    wildfire_parser.add_argument("--workers", type=int, default=None, help="Thread worker count for HRRR patch extraction")
 
     return parser
 
@@ -54,12 +57,17 @@ def main() -> None:
         return
 
     if args.command == "build-station-hrrr-daily":
-        stats = station_daily.run(config, max_hours=args.max_hours, station_limit=args.station_limit)
+        stats = station_daily.run(
+            config,
+            max_hours=args.max_hours,
+            station_limit=args.station_limit,
+            workers=args.workers,
+        )
         print(stats)
         return
 
     if args.command == "evaluate-accuracy":
-        stats = accuracy.run(config)
+        stats = accuracy.run(config, workers=args.workers)
         print(stats)
         return
 
@@ -69,6 +77,7 @@ def main() -> None:
             max_fires=args.max_fires,
             max_samples_total=args.max_samples,
             max_hours_per_fire=args.max_hours_per_fire,
+            workers=args.workers,
         )
         print(stats)
         return
