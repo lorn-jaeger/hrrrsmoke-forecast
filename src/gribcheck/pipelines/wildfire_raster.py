@@ -244,7 +244,6 @@ def _create_or_open_zarr(path: Path, channels: list[str], leads: list[int], patc
             channel,
             shape=(0, h, w),
             chunks=(1, h, w),
-            maxshape=(None, h, w),
             dtype=dtype,
             compressor=comp,
         )
@@ -255,7 +254,6 @@ def _create_or_open_zarr(path: Path, channels: list[str], leads: list[int], patc
             f"t_plus_{lead}h",
             shape=(0, h, w),
             chunks=(1, h, w),
-            maxshape=(None, h, w),
             dtype=dtype,
             compressor=comp,
         )
