@@ -14,6 +14,6 @@ echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] START evaluate-accuracy"
 gribcheck --config "$CFG" evaluate-accuracy --workers "$WORKERS"
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] START build-wildfire-raster-dataset"
-gribcheck --config "$CFG" build-wildfire-raster-dataset --workers "$WORKERS"
+gribcheck --config "$CFG" build-wildfire-raster-dataset --workers "$WORKERS" --sample-hours-utc 0,6,12,18 --next-day-only
 
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] PIPELINE_COMPLETE"

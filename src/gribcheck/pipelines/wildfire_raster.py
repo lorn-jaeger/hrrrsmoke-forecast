@@ -54,7 +54,12 @@ def _floor_to_hour(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(minute=0, second=0, microsecond=0)
 
 
-def _hours_in_fire_window(rec: FireRecord, cadence_after_72h: int, cap: int | None) -> int:
+def _hours_in_fire_window(
+    rec: FireRecord,
+    cadence_after_72h: int,
+    cap: int | None,
+    sample_hours_utc: set[int] | None = None,
+) -> int:
     start = _floor_to_hour(rec.start_time_utc)
     end = _floor_to_hour(rec.end_time_utc)
     if end < start:
@@ -65,14 +70,32 @@ def _hours_in_fire_window(rec: FireRecord, cadence_after_72h: int, cap: int | No
     for i in range(total_hours):
         if i > 72 and cadence_after_72h == 2 and (i % 2 == 1):
             continue
+        hour_utc = (start.hour + i) % 24
+        if sample_hours_utc is not None and hour_utc not in sample_hours_utc:
+            continue
         count += 1
         if cap is not None and count >= cap:
             break
     return count
 
 
-def _estimate_total_samples(records: list[FireRecord], cadence_after_72h: int, cap: int | None) -> int:
-    return int(sum(_hours_in_fire_window(r, cadence_after_72h, cap) for r in records))
+def _estimate_total_samples(
+    records: list[FireRecord],
+    cadence_after_72h: int,
+    cap: int | None,
+    sample_hours_utc: set[int] | None = None,
+) -> int:
+    return int(
+        sum(
+            _hours_in_fire_window(
+                r,
+                cadence_after_72h,
+                cap,
+                sample_hours_utc=sample_hours_utc,
+            )
+            for r in records
+        )
+    )
 
 
 def _estimate_dataset_bytes(sample_count: int, channel_count: int, label_count: int, patch_size: tuple[int, int]) -> int:
@@ -91,9 +114,13 @@ def _is_upper_air_or_dzdt(spec: VariableSpec) -> bool:
     return False
 
 
-def _build_reduction_plan(config: PipelineConfig, records: list[FireRecord]) -> tuple[ReductionPlan, int, int]:
+def _build_reduction_plan(
+    config: PipelineConfig,
+    records: list[FireRecord],
+    label_count: int,
+    sample_hours_utc: set[int] | None = None,
+) -> tuple[ReductionPlan, int, int]:
     active_specs = list(config.wildfire.analysis_variables)
-    lead_count = len(config.wildfire.label_lead_hours)
 
     include_upper_air = True
     cadence_after_72h = 1
@@ -108,13 +135,18 @@ def _build_reduction_plan(config: PipelineConfig, records: list[FireRecord]) -> 
     budget_bytes = int(config.storage.budget_gb * (1024**3))
 
     while True:
-        sample_count = _estimate_total_samples(records, cadence_after_72h=cadence_after_72h, cap=cap)
+        sample_count = _estimate_total_samples(
+            records,
+            cadence_after_72h=cadence_after_72h,
+            cap=cap,
+            sample_hours_utc=sample_hours_utc,
+        )
         # +1 channel for VIIRS FRP rasterized feature.
         ch_count = len(current_specs()) + 1
         est_bytes = _estimate_dataset_bytes(
             sample_count=sample_count,
             channel_count=ch_count,
-            label_count=lead_count,
+            label_count=label_count,
             patch_size=config.wildfire.patch_size,
         )
 
@@ -156,6 +188,7 @@ def _iter_fire_hours(
     rec: FireRecord,
     cadence_after_72h: int,
     cap: int | None,
+    sample_hours_utc: set[int] | None = None,
     max_hours_per_fire: int | None = None,
 ):
     start = _floor_to_hour(rec.start_time_utc)
@@ -169,10 +202,26 @@ def _iter_fire_hours(
         if i > 72 and cadence_after_72h == 2 and (i % 2 == 1):
             continue
         ts = start + timedelta(hours=i)
+        if sample_hours_utc is not None and ts.hour not in sample_hours_utc:
+            continue
         yield ts
         emitted += 1
         if cap is not None and emitted >= cap:
             break
+
+
+def _normalize_sample_hours(sample_hours_utc: tuple[int, ...] | None) -> set[int] | None:
+    if sample_hours_utc is None:
+        return None
+    out: set[int] = set()
+    for value in sample_hours_utc:
+        hour = int(value)
+        if hour < 0 or hour > 23:
+            raise ValueError(f"sample hour must be in [0, 23], got {hour}")
+        out.add(hour)
+    if not out:
+        raise ValueError("sample_hours_utc must not be empty when provided")
+    return out
 
 
 def _build_bounds_xy(rec: FireRecord, buffer_km: float):
@@ -347,6 +396,8 @@ def run(
     max_samples_total: int | None = None,
     max_hours_per_fire: int | None = None,
     workers: int | None = None,
+    sample_hours_utc: tuple[int, ...] | None = None,
+    next_day_only: bool = False,
 ) -> WildfireRasterStats:
     records = load_filtered_fire_records(config)
     if not records:
@@ -354,7 +405,14 @@ def run(
     if max_fires is not None:
         records = records[: int(max_fires)]
 
-    reduction_plan, estimated_samples, estimated_bytes = _build_reduction_plan(config, records)
+    sample_hours = _normalize_sample_hours(sample_hours_utc)
+    leads = [24] if next_day_only else sorted(config.wildfire.label_lead_hours)
+    reduction_plan, estimated_samples, estimated_bytes = _build_reduction_plan(
+        config,
+        records,
+        label_count=len(leads),
+        sample_hours_utc=sample_hours,
+    )
 
     active_specs = list(config.wildfire.analysis_variables)
     if not reduction_plan.include_upper_air:
@@ -362,7 +420,6 @@ def run(
 
     hrrr_channels = [spec.channel_name or f"{spec.variable}_{spec.level}" for spec in active_specs]
     channels = [config.wildfire.frp_channel_name, *hrrr_channels]
-    leads = sorted(config.wildfire.label_lead_hours)
     patch_size = tuple(config.wildfire.patch_size)
     worker_count = _default_workers(workers)
 
@@ -386,8 +443,10 @@ def run(
 
     sample_count = 0
     LOGGER.info(
-        "Building wildfire raster dataset with %d worker(s) for HRRR extraction",
+        "Building wildfire raster dataset with %d worker(s) for HRRR extraction; sample_hours_utc=%s; next_day_only=%s",
         worker_count,
+        sorted(sample_hours) if sample_hours is not None else "all",
+        next_day_only,
     )
 
     with ThreadPoolExecutor(max_workers=worker_count) if worker_count > 1 else nullcontext() as pool:
@@ -401,6 +460,7 @@ def run(
                 rec,
                 cadence_after_72h=reduction_plan.cadence_after_72h,
                 cap=reduction_plan.cap_samples_per_fire,
+                sample_hours_utc=sample_hours,
                 max_hours_per_fire=max_hours_per_fire,
             ):
                 if max_samples_total is not None and sample_count >= int(max_samples_total):
@@ -587,6 +647,8 @@ def run(
         "estimated_sample_count": int(estimated_samples),
         "estimated_bytes": int(estimated_bytes),
         "budget_bytes": int(config.storage.budget_gb * (1024**3)),
+        "sample_hours_utc": sorted(sample_hours) if sample_hours is not None else "all",
+        "next_day_only": bool(next_day_only),
         "reduction_actions": reduction_plan.actions,
         "reduction_plan": {
             "include_upper_air": reduction_plan.include_upper_air,

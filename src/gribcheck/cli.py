@@ -8,6 +8,15 @@ from gribcheck.config import ensure_output_dirs, load_config
 from gribcheck.pipelines import accuracy, pm_ingest, station_daily, wildfire_raster
 
 
+def _parse_hours_csv(value: str | None) -> tuple[int, ...] | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text == "":
+        return None
+    return tuple(int(part.strip()) for part in text.split(",") if part.strip() != "")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gribcheck", description="HRRR + PM2.5 wildfire data pipelines")
     parser.add_argument(
@@ -59,6 +68,18 @@ def _build_parser() -> argparse.ArgumentParser:
     wildfire_parser.add_argument("--max-samples", type=int, default=None, help="Optional cap on total raster samples")
     wildfire_parser.add_argument("--max-hours-per-fire", type=int, default=None, help="Optional cap on scanned run hours per fire")
     wildfire_parser.add_argument("--workers", type=int, default=8, help="Thread worker count for HRRR patch extraction")
+    wildfire_parser.add_argument(
+        "--sample-hours-utc",
+        type=str,
+        default=None,
+        help="Comma-separated UTC hours to sample each fire day (example: 0,6,12,18). Defaults to all hours.",
+    )
+    wildfire_parser.add_argument(
+        "--next-day-only",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Use only +24h next-day actual analysis label (no +12h label).",
+    )
 
     return parser
 
@@ -121,6 +142,8 @@ def main() -> None:
             max_samples_total=args.max_samples,
             max_hours_per_fire=args.max_hours_per_fire,
             workers=args.workers,
+            sample_hours_utc=_parse_hours_csv(args.sample_hours_utc),
+            next_day_only=bool(args.next_day_only),
         )
         print(stats)
         return
