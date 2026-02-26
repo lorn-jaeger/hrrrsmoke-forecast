@@ -94,7 +94,7 @@ def _default_workers(workers: int | None) -> int:
     if workers is not None:
         return max(1, int(workers))
     cpu_count = os.cpu_count() or 2
-    return max(1, min(4, cpu_count))
+    return max(1, min(8, cpu_count))
 
 
 def _summarize_group(df: pd.DataFrame, group_name: str, group_value: str, predictor_col: str) -> dict[str, object]:
@@ -195,11 +195,35 @@ def _maybe_make_plots(df: pd.DataFrame, predictors: list[str], out_dir: Path) ->
         plt.close(fig)
 
 
-def run(config: PipelineConfig, workers: int | None = None) -> AccuracyStats:
-    df = pd.read_parquet(config.paths.station_daily_output)
+def run(
+    config: PipelineConfig,
+    workers: int | None = None,
+    from_checkpoint: bool = False,
+    checkpoint_dir: Path | None = None,
+) -> AccuracyStats:
+    input_path = config.paths.station_daily_output
+    if from_checkpoint:
+        from gribcheck.pipelines import station_daily
+
+        input_path = station_daily.materialize_checkpoint_snapshot(
+            config,
+            checkpoint_dir=checkpoint_dir,
+        )
+
+    df = pd.read_parquet(input_path)
     if df.empty:
         raise ValueError("Joined station dataset is empty; run build-station-hrrr-daily first")
     worker_count = _default_workers(workers)
+
+    usable_massden = int(df["massden_daily_mean"].notna().sum()) if "massden_daily_mean" in df.columns else 0
+    usable_colmd = int(df["colmd_daily_mean"].notna().sum()) if "colmd_daily_mean" in df.columns else 0
+    LOGGER.info(
+        "Accuracy input rows=%d from %s (usable massden=%d, usable colmd=%d)",
+        len(df),
+        input_path,
+        usable_massden,
+        usable_colmd,
+    )
 
     df["date_local"] = pd.to_datetime(df["date_local"]).dt.date
     df["year"] = pd.to_datetime(df["date_local"]).dt.year

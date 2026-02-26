@@ -164,7 +164,7 @@ def _default_workers(workers: int | None) -> int:
     if workers is not None:
         return max(1, int(workers))
     cpu_count = os.cpu_count() or 2
-    return max(1, min(4, cpu_count))
+    return max(1, min(8, cpu_count))
 
 
 def _assign_day_bins(
