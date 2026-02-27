@@ -418,7 +418,7 @@ def compute_cloud_fractions(
     idx = ViirsCloudIndex(base_url=base_url, prefix=prefix)
     out = selected.copy()
 
-    for col in [
+    numeric_cols = [
         "prev_cloud_pct",
         "drop_cloud_pct",
         "next_cloud_pct",
@@ -428,11 +428,13 @@ def compute_cloud_fractions(
         "prev_cloud_time_diff_min",
         "drop_cloud_time_diff_min",
         "next_cloud_time_diff_min",
-        "prev_cloud_key",
-        "drop_cloud_key",
-        "next_cloud_key",
-    ]:
+    ]
+    for col in numeric_cols:
         out[col] = np.nan
+
+    key_cols = ["prev_cloud_key", "drop_cloud_key", "next_cloud_key"]
+    for col in key_cols:
+        out[col] = pd.Series([None] * len(out), dtype="object")
 
     # Resolve cloud granules for each slot.
     req: dict[str, set[int]] = {}
