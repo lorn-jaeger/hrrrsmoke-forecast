@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import re
 import sys
@@ -99,8 +100,25 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("/Users/lorn/Code/gribcheck/data/external/viirs_rgb_cache"),
     )
+    parser.add_argument("--viirs-rgb-source", choices=["gibs", "sdr"], default="gibs")
     parser.add_argument("--viirs-search-hours", type=float, default=18.0)
     parser.add_argument("--viirs-min-file-bytes", type=int, default=1_000_000)
+    parser.add_argument(
+        "--gibs-wms-url",
+        type=str,
+        default="https://gibs.earthdata.nasa.gov/wms/epsg4326/best/wms.cgi",
+    )
+    parser.add_argument(
+        "--gibs-layers",
+        type=str,
+        default="VIIRS_SNPP_CorrectedReflectance_TrueColor,VIIRS_NOAA20_CorrectedReflectance_TrueColor",
+        help="Comma-separated GIBS layers to try in order for VIIRS RGB.",
+    )
+    parser.add_argument(
+        "--gibs-cache-dir",
+        type=Path,
+        default=Path("/Users/lorn/Code/gribcheck/data/external/gibs_viirs_rgb_cache"),
+    )
 
     parser.add_argument("--map-width", type=int, default=1280)
     parser.add_argument("--map-height", type=int, default=840)
@@ -410,6 +428,68 @@ def ensure_viirs_file(base_url: str, key: str, cache_dir: Path) -> Path:
     )
 
 
+def fetch_gibs_viirs_rgb(
+    wms_url: str,
+    layers: list[str],
+    when_date: date,
+    min_lon: float,
+    min_lat: float,
+    max_lon: float,
+    max_lat: float,
+    width: int,
+    height: int,
+    cache_dir: Path,
+) -> tuple[np.ndarray | None, str]:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    bbox_key = f"{min_lon:.4f},{min_lat:.4f},{max_lon:.4f},{max_lat:.4f}"
+    out_shape = f"{width}x{height}"
+    for layer in layers:
+        token = hashlib.md5(f"{layer}|{when_date.isoformat()}|{bbox_key}|{out_shape}".encode("utf-8")).hexdigest()[:12]
+        cache_path = cache_dir / f"{layer}_{when_date:%Y%m%d}_{token}.png"
+        if cache_path.exists() and cache_path.stat().st_size > 500:
+            data = cache_path.read_bytes()
+        else:
+            params = {
+                "SERVICE": "WMS",
+                "REQUEST": "GetMap",
+                "VERSION": "1.1.1",
+                "LAYERS": layer,
+                "STYLES": "",
+                "FORMAT": "image/png",
+                "TRANSPARENT": "TRUE",
+                "SRS": "EPSG:4326",
+                "BBOX": f"{min_lon:.6f},{min_lat:.6f},{max_lon:.6f},{max_lat:.6f}",
+                "WIDTH": str(int(width)),
+                "HEIGHT": str(int(height)),
+                "TIME": when_date.isoformat(),
+            }
+            url = wms_url + ("&" if "?" in wms_url else "?") + urllib.parse.urlencode(params)
+            try:
+                data = http_get_bytes(url=url, timeout_sec=30.0, retries=3, backoff_sec=1.5)
+                cache_path.write_bytes(data)
+            except Exception:
+                continue
+
+        # WMS exceptions can come back as XML instead of PNG.
+        if data[:64].lstrip().lower().startswith(b"<?xml") or b"<ServiceException" in data[:2048]:
+            continue
+        try:
+            arr = plt.imread(BytesIO(data), format="png")
+        except Exception:
+            continue
+        if arr.ndim != 3:
+            continue
+        if arr.dtype.kind == "f":
+            rgb = np.clip(np.round(arr[:, :, :3] * 255.0), 0, 255).astype(np.uint8)
+        else:
+            rgb = np.asarray(arr[:, :, :3], dtype=np.uint8)
+        # Reject effectively empty/black images.
+        if float(rgb.mean()) < 5.0:
+            continue
+        return rgb, f"GIBS {layer} {when_date.isoformat()}"
+    return None, "No GIBS VIIRS RGB"
+
+
 def load_viirs_firms_for_bbox_time(
     viirs_zip: Path,
     min_lon: float,
@@ -521,6 +601,7 @@ def sample_goes_cmi_to_grid(
 
 def to_uint8_rgb(rgb_f32: np.ndarray) -> np.ndarray:
     rgb = np.clip(rgb_f32, 0.0, 1.0)
+    rgb = np.clip(rgb * 1.6, 0.0, 1.0)
     rgb = np.power(rgb, 1.0 / 2.2)
     rgb = np.nan_to_num(rgb, nan=0.0, posinf=1.0, neginf=0.0)
     return np.clip(np.round(rgb * 255.0), 0, 255).astype(np.uint8)
@@ -724,6 +805,7 @@ def main() -> None:
     args = parse_args()
     args.goes_cache_dir.mkdir(parents=True, exist_ok=True)
     args.viirs_cache_dir.mkdir(parents=True, exist_ok=True)
+    args.gibs_cache_dir.mkdir(parents=True, exist_ok=True)
     args.output.parent.mkdir(parents=True, exist_ok=True)
 
     if args.output.suffix.lower() != ".gif":
@@ -943,67 +1025,122 @@ def main() -> None:
         sub = slot_groups.get(s)
         if sub is not None and not sub.empty:
             day_sub = sub[sub["daynight"] == "D"]
-            src = day_sub if not day_sub.empty else sub
-            mid = src["acq_datetime"].iloc[len(src) // 2].to_pydatetime()
-            slot_targets.append(mid.astimezone(timezone.utc))
-            continue
+            if not day_sub.empty:
+                mid = day_sub["acq_datetime"].iloc[len(day_sub) // 2].to_pydatetime()
+                slot_targets.append(mid.astimezone(timezone.utc))
+                continue
         slot_targets.append(ss + (ee - ss) / 2)
 
     print("Preparing VIIRS RGB slot images...")
-    viirs_idx = ViirsRgbIndex(base_url=args.viirs_base_url, min_file_bytes=args.viirs_min_file_bytes)
     viirs_slots: list[np.ndarray] = []
     viirs_slot_label: list[str] = []
-    viirs_rgb_cache: dict[str, np.ndarray] = {}
-    for s, target_dt in enumerate(slot_targets):
-        candidates = viirs_idx.nearest_triplets(target_dt=target_dt, search_hours=args.viirs_search_hours)
-        slot_img = np.zeros((args.grid_ny, args.grid_nx, 3), dtype=np.uint8)
-        label = "No VIIRS RGB"
-        for _diff_sec, m3, m4, m5, geo in candidates[:40]:
-            if m3.stem in viirs_rgb_cache:
-                slot_img = viirs_rgb_cache[m3.stem]
+    if args.viirs_rgb_source == "gibs":
+        layers = [x.strip() for x in str(args.gibs_layers).split(",") if x.strip()]
+        if not layers:
+            layers = ["VIIRS_SNPP_CorrectedReflectance_TrueColor"]
+        for s, target_dt in enumerate(slot_targets):
+            slot_img = np.zeros((args.grid_ny, args.grid_nx, 3), dtype=np.uint8)
+            rgb_u8, label = fetch_gibs_viirs_rgb(
+                wms_url=args.gibs_wms_url,
+                layers=layers,
+                when_date=target_dt.date(),
+                min_lon=minx,
+                min_lat=miny,
+                max_lon=maxx,
+                max_lat=maxy,
+                width=args.grid_nx,
+                height=args.grid_ny,
+                cache_dir=args.gibs_cache_dir,
+            )
+            if rgb_u8 is not None:
+                slot_img = rgb_u8
+            else:
+                label = "No VIIRS RGB"
+
+            if label == "No VIIRS RGB" and viirs_slots:
+                slot_img = viirs_slots[-1].copy()
+                label = "VIIRS carry-forward (no GIBS tile)"
+
+            viirs_slots.append(slot_img)
+            viirs_slot_label.append(label)
+            if (s + 1) % 4 == 0 or (s + 1) == n_slots:
+                print(f"Prepared VIIRS slots: {s + 1}/{n_slots}")
+    else:
+        viirs_idx = ViirsRgbIndex(base_url=args.viirs_base_url, min_file_bytes=args.viirs_min_file_bytes)
+        viirs_rgb_cache: dict[str, np.ndarray] = {}
+        fire_lon = float(fire.geometry.centroid.x)
+        for s, target_dt in enumerate(slot_targets):
+            candidates = viirs_idx.nearest_triplets(target_dt=target_dt, search_hours=args.viirs_search_hours)
+            candidates = sorted(
+                candidates,
+                key=lambda c: (
+                    0
+                    if 7.0
+                    <= (((c[1].start_time_utc.hour + (c[1].start_time_utc.minute / 60.0)) + (fire_lon / 15.0)) % 24.0)
+                    <= 18.0
+                    else 1,
+                    c[0],
+                ),
+            )
+            slot_img = np.zeros((args.grid_ny, args.grid_nx, 3), dtype=np.uint8)
+            label = "No VIIRS RGB"
+            for _diff_sec, m3, m4, m5, geo in candidates[:200]:
+                if m3.stem in viirs_rgb_cache:
+                    slot_img = viirs_rgb_cache[m3.stem]
+                    label = f"VIIRS {m3.start_time_utc.strftime('%Y-%m-%d %H:%M UTC')}"
+                    break
+
+                p3 = ensure_viirs_file(args.viirs_base_url, m3.key, args.viirs_cache_dir)
+                p4 = ensure_viirs_file(args.viirs_base_url, m4.key, args.viirs_cache_dir)
+                p5 = ensure_viirs_file(args.viirs_base_url, m5.key, args.viirs_cache_dir)
+                pg = ensure_viirs_file(args.viirs_base_url, geo.key, args.viirs_cache_dir)
+
+                try:
+                    m3_ref = read_viirs_reflectance(p3, 3)
+                    m4_ref = read_viirs_reflectance(p4, 4)
+                    m5_ref = read_viirs_reflectance(p5, 5)
+                    lon, lat, sza = read_viirs_geo(pg)
+                    rgb_u8, coverage = grid_viirs_rgb(
+                        lon=lon,
+                        lat=lat,
+                        sza=sza,
+                        m3=m3_ref,
+                        m4=m4_ref,
+                        m5=m5_ref,
+                        min_lon=minx,
+                        min_lat=miny,
+                        max_lon=maxx,
+                        max_lat=maxy,
+                        nx=args.grid_nx,
+                        ny=args.grid_ny,
+                    )
+                except Exception:
+                    rgb_u8, coverage = None, 0.0
+                if rgb_u8 is None:
+                    continue
+                if coverage < 0.0008:
+                    continue
+                slot_img = rgb_u8
                 label = f"VIIRS {m3.start_time_utc.strftime('%Y-%m-%d %H:%M UTC')}"
+                viirs_rgb_cache[m3.stem] = slot_img
                 break
 
-            p3 = ensure_viirs_file(args.viirs_base_url, m3.key, args.viirs_cache_dir)
-            p4 = ensure_viirs_file(args.viirs_base_url, m4.key, args.viirs_cache_dir)
-            p5 = ensure_viirs_file(args.viirs_base_url, m5.key, args.viirs_cache_dir)
-            pg = ensure_viirs_file(args.viirs_base_url, geo.key, args.viirs_cache_dir)
+            if label == "No VIIRS RGB" and viirs_slots:
+                slot_img = viirs_slots[-1].copy()
+                label = "VIIRS carry-forward (no daytime swath)"
 
-            try:
-                m3_ref = read_viirs_reflectance(p3, 3)
-                m4_ref = read_viirs_reflectance(p4, 4)
-                m5_ref = read_viirs_reflectance(p5, 5)
-                lon, lat, sza = read_viirs_geo(pg)
-                rgb_u8, coverage = grid_viirs_rgb(
-                    lon=lon,
-                    lat=lat,
-                    sza=sza,
-                    m3=m3_ref,
-                    m4=m4_ref,
-                    m5=m5_ref,
-                    min_lon=minx,
-                    min_lat=miny,
-                    max_lon=maxx,
-                    max_lat=maxy,
-                    nx=args.grid_nx,
-                    ny=args.grid_ny,
-                )
-            except Exception:
-                rgb_u8, coverage = None, 0.0
-            if rgb_u8 is None:
-                continue
-            if coverage < 0.0008:
-                # Swath likely missed this bbox.
-                continue
-            slot_img = rgb_u8
-            label = f"VIIRS {m3.start_time_utc.strftime('%Y-%m-%d %H:%M UTC')}"
-            viirs_rgb_cache[m3.stem] = slot_img
-            break
+            viirs_slots.append(slot_img)
+            viirs_slot_label.append(label)
+            if (s + 1) % 4 == 0 or (s + 1) == n_slots:
+                print(f"Prepared VIIRS slots: {s + 1}/{n_slots}")
 
-        viirs_slots.append(slot_img)
-        viirs_slot_label.append(label)
-        if (s + 1) % 4 == 0 or (s + 1) == n_slots:
-            print(f"Prepared VIIRS slots: {s + 1}/{n_slots}")
+    n_viirs_real = sum(1 for x in viirs_slot_label if ("carry-forward" not in x and x != "No VIIRS RGB"))
+    n_viirs_carry = sum(1 for x in viirs_slot_label if "carry-forward" in x)
+    n_viirs_none = sum(1 for x in viirs_slot_label if x == "No VIIRS RGB")
+    print(
+        f"VIIRS slot summary: real={n_viirs_real}/{n_slots}, carry={n_viirs_carry}/{n_slots}, "
+        f"none={n_viirs_none}/{n_slots}"
+    )
 
     bg_img = None
     if args.map_background:
@@ -1031,7 +1168,10 @@ def main() -> None:
     im_night = ax_night.imshow(night_slot_masks[s0], origin="lower", extent=extent, cmap="magma", vmin=0, vmax=1, alpha=0.75, zorder=2)
     sc_night = ax_night.scatter([], [], s=9, c="#7ff7ff", alpha=0.85, linewidths=0.0, zorder=4)
     ax_go.set_title("GOES-18 RGB (C02 + synthetic G + C01)")
-    ax_vi.set_title(f"VIIRS True Color (day-preferred, held {hold_hours}h)")
+    if args.viirs_rgb_source == "gibs":
+        ax_vi.set_title("VIIRS True Color (GIBS daily)")
+    else:
+        ax_vi.set_title(f"VIIRS True Color (day-preferred SDR, held {hold_hours}h)")
     ax_night.set_title(f"VIIRS FIRMS Night Detections (held {hold_hours}h)")
     supt = fig.suptitle("")
 

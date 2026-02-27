@@ -58,6 +58,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebound-prev-frac-min", type=float, default=0.5)
     parser.add_argument("--max-fires", type=int, default=60)
     parser.add_argument("--events-per-fire", type=int, default=1)
+    parser.add_argument("--max-events", type=int, default=0, help="Optional hard cap on selected events (0 = no cap).")
     parser.add_argument("--max-cloud-time-diff-min", type=float, default=30.0)
     parser.add_argument(
         "--cloud-base-url",
@@ -634,10 +635,12 @@ def main() -> None:
         .sort_values("score", ascending=False)
         .reset_index(drop=True)
     )
+    if int(args.max_events) > 0:
+        selected = selected.head(int(args.max_events)).reset_index(drop=True)
     print(
         f"Selected events for cloud check: {len(selected):,} "
         f"across {selected['fire_idx'].nunique():,} fires "
-        f"(events_per_fire={int(args.events_per_fire)})"
+        f"(events_per_fire={int(args.events_per_fire)}, max_events={int(args.max_events)})"
     )
 
     # Attach fire metadata.
