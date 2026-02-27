@@ -373,8 +373,8 @@ def add_cloudiness(panel: pd.DataFrame, fires: list[WfigsFire], args: argparse.N
     if some_key.empty:
         some_key = out["goes_night_key"].dropna()
     if some_key.empty:
-        out["cloud_day_frac"] = np.nan
-        out["cloud_night_frac"] = np.nan
+        out["cloud_day_pct"] = np.nan
+        out["cloud_night_pct"] = np.nan
         return out
 
     first_path = ensure_goes_file(args.goes_base_url, str(some_key.iloc[0]), args.goes_cache_dir)
@@ -437,8 +437,10 @@ def add_cloudiness(panel: pd.DataFrame, fires: list[WfigsFire], args: argparse.N
         nc = key_fire_cloud.get((r.goes_night_key, fi), np.nan) if isinstance(r.goes_night_key, str) else np.nan
         day_cloud.append(dc)
         night_cloud.append(nc)
-    out["cloud_day_frac"] = day_cloud
-    out["cloud_night_frac"] = night_cloud
+    day_cloud = np.asarray(day_cloud, dtype=np.float64)
+    night_cloud = np.asarray(night_cloud, dtype=np.float64)
+    out["cloud_day_pct"] = day_cloud * 100.0
+    out["cloud_night_pct"] = night_cloud * 100.0
     return out
 
 
@@ -506,8 +508,8 @@ def main() -> None:
         "viirs_pixels_night",
         "viirs_frp_sum_mw",
         "viirs_frp_mean_mw",
-        "cloud_day_frac",
-        "cloud_night_frac",
+        "cloud_day_pct",
+        "cloud_night_pct",
         "goes_day_time_diff_min",
         "goes_night_time_diff_min",
         "centroid_lon",
@@ -528,8 +530,8 @@ def main() -> None:
         "date_max": str(panel["day_date"].max()),
         "mean_viirs_pixels": float(panel["viirs_pixels_total"].mean()),
         "pct_rows_no_viirs": float((panel["viirs_pixels_total"] == 0).mean()),
-        "cloud_day_nonnull_frac": float(panel["cloud_day_frac"].notna().mean()),
-        "cloud_night_nonnull_frac": float(panel["cloud_night_frac"].notna().mean()),
+        "cloud_day_nonnull_frac": float(panel["cloud_day_pct"].notna().mean()),
+        "cloud_night_nonnull_frac": float(panel["cloud_night_pct"].notna().mean()),
     }
     with args.output_csv.with_suffix(".summary.json").open("w", encoding="utf-8") as fp:
         import json
