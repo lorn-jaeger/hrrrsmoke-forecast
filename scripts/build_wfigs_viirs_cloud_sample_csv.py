@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
+import urllib.request
+import xml.etree.ElementTree as ET
 import zipfile
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -20,7 +23,12 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from scripts.mtbs_wfigs_coherence_analysis import DAY0, day_int_from_date  # noqa: E402
-from scripts.wfigs_viirs_missing_causes_sample import GoesIndex, ensure_goes_file  # noqa: E402
+from scripts.wfigs_viirs_missing_causes_sample import (  # noqa: E402
+    GOES_XML_NS,
+    GoesFileRef,
+    GoesIndex,
+    parse_goes_start_from_key,
+)
 from scripts.wfigs_viirs_stats import WfigsFire, load_wfigs_fires  # noqa: E402
 
 
@@ -43,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--min-acres", type=float, default=5000.0)
     parser.add_argument("--sample-rows", type=int, default=250)
     parser.add_argument("--points-per-fire", type=int, default=20)
+    parser.add_argument("--goes-workers", type=int, default=8)
     parser.add_argument("--random-seed", type=int, default=19)
     parser.add_argument(
         "--goes-base-url",
@@ -66,6 +75,69 @@ def parse_args() -> argparse.Namespace:
         default=Path("/Users/lorn/Code/gribcheck/reports/wfigs_viirs_cloud_sample_2021_2025_5000ac.csv"),
     )
     return parser.parse_args()
+
+
+def round_dt(dt: datetime, minutes: int = 15) -> datetime:
+    if dt.tzinfo is None:
+        raise ValueError("round_dt expects timezone-aware datetime")
+    sec = int(dt.timestamp())
+    step = minutes * 60
+    rounded = int((sec + step / 2) // step) * step
+    return datetime.fromtimestamp(rounded, tz=timezone.utc)
+
+
+class FastGoesIndex(GoesIndex):
+    """Fail-fast S3 index lookup to keep large sample jobs practical."""
+
+    def __init__(self, base_url: str, product_prefix: str, timeout_sec: float = 6.0):
+        super().__init__(base_url=base_url, product_prefix=product_prefix)
+        self.timeout_sec = timeout_sec
+
+    def list_hour(self, year: int, doy: int, hour: int) -> list[GoesFileRef]:
+        key = (year, doy, hour)
+        if key in self.cache:
+            return self.cache[key]
+
+        prefix = f"{self.product_prefix}/{year}/{doy:03d}/{hour:02d}/"
+        url = f"{self.base_url}/?prefix={prefix}"
+        out: list[GoesFileRef] = []
+        try:
+            with urllib.request.urlopen(url, timeout=self.timeout_sec) as resp:
+                xml_bytes = resp.read()
+            root = ET.fromstring(xml_bytes)
+            for node in root.findall("s3:Contents", GOES_XML_NS):
+                k_node = node.find("s3:Key", GOES_XML_NS)
+                if k_node is None or not k_node.text:
+                    continue
+                k = k_node.text.strip()
+                if not k.endswith(".nc"):
+                    continue
+                ts = parse_goes_start_from_key(k)
+                if ts is None:
+                    continue
+                out.append(GoesFileRef(key=k, start_time_utc=ts))
+        except Exception:
+            out = []
+
+        out.sort(key=lambda r: r.start_time_utc)
+        self.cache[key] = out
+        return out
+
+
+def ensure_goes_file_fast(base_url: str, key: str, cache_dir: Path, timeout_sec: float = 20.0) -> Path:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    fn = key.split("/")[-1]
+    out_path = cache_dir / fn
+    if out_path.exists() and out_path.stat().st_size > 1000:
+        return out_path
+
+    url = f"{base_url.rstrip('/')}/{key}"
+    with urllib.request.urlopen(url, timeout=timeout_sec) as resp:
+        data = resp.read()
+    tmp = out_path.with_suffix(".tmp")
+    tmp.write_bytes(data)
+    tmp.replace(out_path)
+    return out_path
 
 
 def classify_conf(series: pd.Series) -> np.ndarray:
@@ -352,21 +424,26 @@ def add_cloudiness(panel: pd.DataFrame, fires: list[WfigsFire], args: argparse.N
     out["day_overpass_utc"] = [b + timedelta(hours=float(h)) for b, h in zip(base_dt, day_hour_utc, strict=True)]
     out["night_overpass_utc"] = [b + timedelta(hours=float(h)) for b, h in zip(base_dt, night_hour_utc, strict=True)]
 
-    idx = GoesIndex(base_url=args.goes_base_url, product_prefix=args.goes_prefix)
-    day_keys, day_diff, night_keys, night_diff = [], [], [], []
-    for i, (d1, d2) in enumerate(zip(out["day_overpass_utc"], out["night_overpass_utc"], strict=True), start=1):
-        k1, m1 = idx.nearest(d1, max_abs_minutes=45.0)
-        k2, m2 = idx.nearest(d2, max_abs_minutes=45.0)
-        day_keys.append(k1)
-        day_diff.append(m1)
-        night_keys.append(k2)
-        night_diff.append(m2)
-        if i % 100 == 0:
-            print(f"GOES nearest-key matched rows: {i}/{len(out)}")
-    out["goes_day_key"] = day_keys
-    out["goes_day_time_diff_min"] = day_diff
-    out["goes_night_key"] = night_keys
-    out["goes_night_time_diff_min"] = night_diff
+    idx = FastGoesIndex(base_url=args.goes_base_url, product_prefix=args.goes_prefix, timeout_sec=6.0)
+    goes_start = datetime(2022, 3, 1, tzinfo=timezone.utc)
+
+    day_targets = [round_dt(x, minutes=15) for x in out["day_overpass_utc"].tolist()]
+    night_targets = [round_dt(x, minutes=15) for x in out["night_overpass_utc"].tolist()]
+    uniq_targets = sorted(set(day_targets + night_targets))
+
+    target_lookup: dict[datetime, tuple[str | None, float | None]] = {}
+    for i, t in enumerate(uniq_targets, start=1):
+        if t < goes_start:
+            target_lookup[t] = (None, None)
+        else:
+            target_lookup[t] = idx.nearest(t, max_abs_minutes=50.0)
+        if i % 200 == 0:
+            print(f"GOES unique overpass-times matched: {i}/{len(uniq_targets)}")
+
+    out["goes_day_key"] = [target_lookup[t][0] for t in day_targets]
+    out["goes_day_time_diff_min"] = [target_lookup[t][1] for t in day_targets]
+    out["goes_night_key"] = [target_lookup[t][0] for t in night_targets]
+    out["goes_night_time_diff_min"] = [target_lookup[t][1] for t in night_targets]
 
     # Build projection from first available file.
     some_key = out["goes_day_key"].dropna()
@@ -377,7 +454,12 @@ def add_cloudiness(panel: pd.DataFrame, fires: list[WfigsFire], args: argparse.N
         out["cloud_night_pct"] = np.nan
         return out
 
-    first_path = ensure_goes_file(args.goes_base_url, str(some_key.iloc[0]), args.goes_cache_dir)
+    try:
+        first_path = ensure_goes_file_fast(args.goes_base_url, str(some_key.iloc[0]), args.goes_cache_dir)
+    except Exception:
+        out["cloud_day_pct"] = np.nan
+        out["cloud_night_pct"] = np.nan
+        return out
     with Dataset(first_path) as ds:
         x_grid = ds.variables["x"][:].astype(np.float64)
         y_grid = ds.variables["y"][:].astype(np.float64)
@@ -409,26 +491,40 @@ def add_cloudiness(panel: pd.DataFrame, fires: list[WfigsFire], args: argparse.N
         if isinstance(r.goes_night_key, str):
             req.setdefault(r.goes_night_key, set()).add(int(r.fire_idx))
 
-    key_fire_cloud: dict[tuple[str, int], float] = {}
-    for i, (key, fs) in enumerate(req.items(), start=1):
-        path = ensure_goes_file(args.goes_base_url, key, args.goes_cache_dir)
-        with Dataset(path) as ds:
-            bcm = ds.variables["BCM"][:]
-            dqf = ds.variables["DQF"][:]
+    def process_key(item: tuple[str, set[int]]) -> dict[tuple[str, int], float]:
+        key, fs = item
+        res: dict[tuple[str, int], float] = {}
+        try:
+            path = ensure_goes_file_fast(args.goes_base_url, key, args.goes_cache_dir)
+            with Dataset(path) as ds:
+                bcm = ds.variables["BCM"][:]
+                dqf = ds.variables["DQF"][:]
+                for fi in fs:
+                    xs, ys = fire_pts[fi]
+                    if xs.size == 0:
+                        res[(key, fi)] = np.nan
+                        continue
+                    bvals = bcm[ys, xs]
+                    qvals = dqf[ys, xs]
+                    valid = qvals != 255
+                    if not np.any(valid):
+                        res[(key, fi)] = np.nan
+                        continue
+                    res[(key, fi)] = float(np.mean(bvals[valid] == 1))
+        except Exception:
             for fi in fs:
-                xs, ys = fire_pts[fi]
-                if xs.size == 0:
-                    key_fire_cloud[(key, fi)] = np.nan
-                    continue
-                bvals = bcm[ys, xs]
-                qvals = dqf[ys, xs]
-                valid = qvals != 255
-                if not np.any(valid):
-                    key_fire_cloud[(key, fi)] = np.nan
-                    continue
-                key_fire_cloud[(key, fi)] = float(np.mean(bvals[valid] == 1))
-        if i % 50 == 0:
-            print(f"GOES files processed: {i}/{len(req)}")
+                res[(key, fi)] = np.nan
+        return res
+
+    key_fire_cloud: dict[tuple[str, int], float] = {}
+    req_items = list(req.items())
+    workers = max(1, int(args.goes_workers))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(process_key, item) for item in req_items]
+        for i, fut in enumerate(as_completed(futs), start=1):
+            key_fire_cloud.update(fut.result())
+            if i % 50 == 0:
+                print(f"GOES files processed: {i}/{len(req_items)}")
 
     day_cloud, night_cloud = [], []
     for r in out.itertuples(index=False):
