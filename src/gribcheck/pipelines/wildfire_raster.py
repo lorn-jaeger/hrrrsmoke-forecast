@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import shutil
+import time as time_module
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -24,6 +26,14 @@ from gribcheck.viirs import build_viirs_rasterizer, load_or_build_viirs_hourly_p
 
 LOGGER = logging.getLogger(__name__)
 
+# HRRR CONUS Lambert grid bounds (x/y meters) for the hrrrzarr sfc product.
+HRRR_CONUS_DOMAIN_BOUNDS_XY = (
+    -2697520.1425219304,
+    -1587306.1525566636,
+    2696479.8574780696,
+    1586693.8474433364,
+)
+
 
 @dataclass(frozen=True)
 class WildfireRasterStats:
@@ -39,6 +49,15 @@ class ReductionPlan:
     cadence_after_72h: int
     cap_samples_per_fire: int | None
     actions: list[str]
+
+
+@dataclass(frozen=True)
+class _DailyTask:
+    rec: FireRecord
+    sample_day: date
+    run_time: datetime
+    sample_key: str
+    split: str
 
 
 def _default_workers(workers: int | None) -> int:
@@ -376,6 +395,65 @@ def _build_bounds_xy(rec: FireRecord, buffer_km: float):
     return (xmin - buffer_m, ymin - buffer_m, xmax + buffer_m, ymax + buffer_m)
 
 
+def _boxes_intersect(a: tuple[float, float, float, float], b: tuple[float, float, float, float]) -> bool:
+    axmin, aymin, axmax, aymax = a
+    bxmin, bymin, bxmax, bymax = b
+    return not (axmax < bxmin or axmin > bxmax or aymax < bymin or aymin > bymax)
+
+
+def _detect_hrrr_domain_bounds(
+    reader: HRRRAnalysisReader,
+    reference_spec: VariableSpec,
+    run_start: date,
+    run_end: date,
+) -> tuple[float, float, float, float] | None:
+    mid_day = run_start + timedelta(days=max(0, (run_end - run_start).days // 2))
+    candidate_days = [run_end, mid_day, run_start, date(2024, 9, 11), date(2023, 8, 15), date(2022, 7, 15)]
+    candidate_hours = [0, 6, 12, 18, 23]
+
+    seen: set[tuple[date, int]] = set()
+    for day in candidate_days:
+        for hour in candidate_hours:
+            key = (day, hour)
+            if key in seen:
+                continue
+            seen.add(key)
+            ts = _utc_datetime(day, hour)
+            da = reader.load_field(ts, reference_spec)
+            if da is None:
+                continue
+            x_vals = da["x"].to_numpy()
+            y_vals = da["y"].to_numpy()
+            if x_vals.size == 0 or y_vals.size == 0:
+                continue
+            return (
+                float(np.min(x_vals)),
+                float(np.min(y_vals)),
+                float(np.max(x_vals)),
+                float(np.max(y_vals)),
+            )
+    return None
+
+
+def _filter_records_to_hrrr_domain(
+    records: list[FireRecord],
+    buffer_km: float,
+    domain_bounds_xy: tuple[float, float, float, float] | None,
+) -> tuple[list[FireRecord], dict[str, int]]:
+    if domain_bounds_xy is None:
+        return records, {}
+
+    kept: list[FireRecord] = []
+    dropped_state_counts: Counter[str] = Counter()
+    for rec in records:
+        fire_bounds = _build_bounds_xy(rec, buffer_km=buffer_km)
+        if _boxes_intersect(fire_bounds, domain_bounds_xy):
+            kept.append(rec)
+        else:
+            dropped_state_counts[rec.state or "NA"] += 1
+    return kept, dict(dropped_state_counts)
+
+
 def _subset_to_bounds(field, bounds_xy):
     xmin, ymin, xmax, ymax = bounds_xy
 
@@ -419,6 +497,13 @@ def _extract_patch(reader: HRRRAnalysisReader, run_time_utc: datetime, spec: Var
     return _resample_to_patch(subset, patch_size=patch_size)
 
 
+def _extract_patch_from_loaded_field(field, bounds_xy, patch_size):
+    if field is None:
+        return None
+    subset = _subset_to_bounds(field, bounds_xy)
+    return _resample_to_patch(subset, patch_size=patch_size)
+
+
 def _extract_patch_threaded(
     reader: HRRRAnalysisReader,
     run_time_utc: datetime,
@@ -427,6 +512,61 @@ def _extract_patch_threaded(
     patch_size,
 ):
     return _extract_patch(reader, run_time_utc=run_time_utc, spec=spec, bounds_xy=bounds_xy, patch_size=patch_size)
+
+
+def _build_daily_task_patches_from_loaded_fields(
+    task: _DailyTask,
+    config: PipelineConfig,
+    patch_size: tuple[int, int],
+    source_times: list[datetime],
+    label_times_by_lead: dict[int, list[datetime]],
+    active_specs: list[VariableSpec],
+    hrrr_channels: list[str],
+    source_field_by_spec_time: dict[tuple[int, datetime], object],
+    label_field_by_time: dict[datetime, object],
+    viirs_rasterizer,
+) -> tuple[dict[str, np.ndarray], dict[int, np.ndarray]] | None:
+    bounds_xy = _build_bounds_xy(task.rec, buffer_km=config.wildfire.buffer_km)
+
+    input_hourly: dict[str, list[np.ndarray]] = {config.wildfire.frp_channel_name: []}
+    for channel_name in hrrr_channels:
+        input_hourly[channel_name] = []
+    label_hourly: dict[int, list[np.ndarray]] = {lead: [] for lead in label_times_by_lead}
+
+    for ts in source_times:
+        frp_patch = viirs_rasterizer.patch_for_hour(
+            run_time_utc=ts,
+            bounds_xy=bounds_xy,
+            patch_size=patch_size,
+        )
+        input_hourly[config.wildfire.frp_channel_name].append(frp_patch)
+
+    for spec_idx, _spec in enumerate(active_specs):
+        channel_name = hrrr_channels[spec_idx]
+        for ts in source_times:
+            field = source_field_by_spec_time.get((spec_idx, ts))
+            patch = _extract_patch_from_loaded_field(field, bounds_xy=bounds_xy, patch_size=patch_size)
+            if patch is None:
+                return None
+            input_hourly[channel_name].append(patch)
+
+    for lead, label_times in label_times_by_lead.items():
+        for ts in label_times:
+            field = label_field_by_time.get(ts)
+            patch = _extract_patch_from_loaded_field(field, bounds_xy=bounds_xy, patch_size=patch_size)
+            if patch is None:
+                return None
+            label_hourly[lead].append(patch)
+
+    expected_input_count = len(source_times)
+    if any(len(v) != expected_input_count for v in input_hourly.values()):
+        return None
+    if any(len(label_hourly[lead]) != len(label_times_by_lead[lead]) for lead in label_times_by_lead):
+        return None
+
+    input_patches = {channel: _mean_patches(patches) for channel, patches in input_hourly.items()}
+    label_patches = {lead: _mean_patches(patches) for lead, patches in label_hourly.items()}
+    return input_patches, label_patches
 
 
 def _index_checkpoint_path(index_path: Path) -> Path:
@@ -705,6 +845,516 @@ def _maybe_write_qa_tiff(path: Path, sample_id: int, channel_name: str, arr: np.
     tifffile.imwrite(path / f"sample_{sample_id:06d}_{channel_name}.tiff", arr.astype(np.float32), compression="deflate")
 
 
+def _run_daily_time_major(
+    config: PipelineConfig,
+    records: list[FireRecord],
+    active_specs: list[VariableSpec],
+    hrrr_channels: list[str],
+    channels: list[str],
+    patch_size: tuple[int, int],
+    worker_count: int,
+    sample_hours: set[int] | None,
+    leads: list[int],
+    reduction_plan: ReductionPlan,
+    estimated_samples: int,
+    estimated_bytes: int,
+    max_samples_cap: int | None,
+    max_hours_per_fire: int | None,
+    completed_sample_keys: set[str],
+    resumed_samples: int,
+    existing_rows: list[dict[str, object]],
+    resume: bool,
+    resume_source: str,
+    index_checkpoint: Path,
+    flush_every: int,
+    reader: HRRRAnalysisReader,
+    viirs_rasterizer,
+    input_arrays: dict[str, zarr.Array],
+    label_arrays: dict[int, zarr.Array],
+    field_cache_entries: int,
+    truncated_samples: int,
+    sort_times_by_fire_count: bool,
+    verbose_progress: bool,
+    progress_interval_seconds: int,
+) -> WildfireRasterStats:
+    if sample_hours is None:
+        raise ValueError("time-major daily mode requires explicit sample hours")
+
+    source_hours_sorted = sorted(sample_hours)
+    run_anchor_hour = int(source_hours_sorted[0])
+
+    index_rows_buffer: list[dict[str, object]] = []
+    sample_count = resumed_samples
+    new_samples_written = 0
+    skipped_missing_day_tasks = 0
+    skipped_missing_run_day_tasks = 0
+    skipped_patch_failures = 0
+    days_with_loaded_fields = 0
+
+    start_time = time_module.monotonic()
+    last_progress_time = start_time
+
+    def _flush_index_rows() -> None:
+        nonlocal index_rows_buffer
+        if not index_rows_buffer:
+            return
+        _append_index_checkpoint_rows(index_checkpoint, index_rows_buffer, mode="a")
+        index_rows_buffer = []
+
+    tasks_by_day: dict[date, list[_DailyTask]] = {}
+    candidate_tasks = 0
+    for rec in records:
+        max_days_per_fire = int(max_hours_per_fire) if max_hours_per_fire is not None else None
+        for sample_day in _iter_fire_days(
+            rec,
+            cap=reduction_plan.cap_samples_per_fire,
+            run_start=config.run.start_date,
+            run_end=config.run.end_date,
+            require_next_day=True,
+            max_days_per_fire=max_days_per_fire,
+        ):
+            run_time = _utc_datetime(sample_day, run_anchor_hour)
+            sample_key = _sample_key(
+                fire_id=rec.unique_fire_id,
+                sample_day=sample_day,
+                run_time=run_time,
+                daily_aggregate=True,
+                sample_hours=sample_hours,
+            )
+            candidate_tasks += 1
+            if sample_key in completed_sample_keys:
+                continue
+            split = split_for_date(sample_day, config.split)
+            tasks_by_day.setdefault(sample_day, []).append(
+                _DailyTask(
+                    rec=rec,
+                    sample_day=sample_day,
+                    run_time=run_time,
+                    sample_key=sample_key,
+                    split=split,
+                )
+            )
+
+    day_order = sorted(tasks_by_day)
+    if sort_times_by_fire_count:
+        day_order = sorted(day_order, key=lambda d: (-len(tasks_by_day[d]), d))
+
+    pending_tasks = int(sum(len(v) for v in tasks_by_day.values()))
+    LOGGER.info(
+        "Building wildfire raster dataset with %d worker(s) for HRRR extraction; mode=time_major_daily; field_cache_entries=%d; sample_hours_utc=%s; resume=%s; resumed_samples=%d; pending_tasks=%d; pending_days=%d; sort_times_by_fire_count=%s; flush_every=%d",
+        worker_count,
+        field_cache_entries,
+        source_hours_sorted,
+        resume,
+        resumed_samples,
+        pending_tasks,
+        len(day_order),
+        sort_times_by_fire_count,
+        flush_every,
+    )
+
+    def _maybe_log_progress(day_idx: int, total_days: int, sample_day: date, force: bool = False) -> None:
+        nonlocal last_progress_time
+        if not verbose_progress and not force:
+            return
+        now = time_module.monotonic()
+        if not force and (now - last_progress_time) < float(progress_interval_seconds):
+            return
+        elapsed = max(1e-6, now - start_time)
+        rate = float(new_samples_written) / elapsed
+        LOGGER.info(
+            "Time-major progress: day=%s (%d/%d), total_samples=%d, new_samples=%d, pending_days=%d, rate=%.2f samples/s, missing_day_tasks=%d, patch_failures=%d",
+            sample_day.isoformat(),
+            day_idx,
+            total_days,
+            sample_count,
+            new_samples_written,
+            max(total_days - day_idx, 0),
+            rate,
+            skipped_missing_day_tasks,
+            skipped_patch_failures,
+        )
+        last_progress_time = now
+
+    try:
+        with ThreadPoolExecutor(max_workers=worker_count) if worker_count > 1 else nullcontext() as pool:
+            for day_idx, sample_day in enumerate(day_order, start=1):
+                if max_samples_cap is not None and sample_count >= max_samples_cap:
+                    break
+
+                day_tasks = tasks_by_day[sample_day]
+                if max_samples_cap is not None:
+                    remaining = max_samples_cap - sample_count
+                    if remaining <= 0:
+                        break
+                    if len(day_tasks) > remaining:
+                        day_tasks = day_tasks[:remaining]
+
+                source_times = [_utc_datetime(sample_day, hour) for hour in source_hours_sorted]
+                label_times_by_lead = {
+                    lead: [ts + timedelta(hours=int(lead)) for ts in source_times]
+                    for lead in leads
+                }
+                label_times_unique = sorted({ts for times in label_times_by_lead.values() for ts in times})
+                required_times = sorted(set(source_times + label_times_unique))
+
+                run_available_fn = getattr(reader, "run_available", None)
+                if callable(run_available_fn):
+                    missing_required_runs = [ts for ts in required_times if not bool(run_available_fn(ts))]
+                else:
+                    missing_required_runs = []
+                if missing_required_runs:
+                    skipped_missing_day_tasks += len(day_tasks)
+                    skipped_missing_run_day_tasks += len(day_tasks)
+                    if verbose_progress:
+                        LOGGER.info(
+                            "Time-major day %s skipped: missing %d/%d required analysis runs (first missing: %s)",
+                            sample_day.isoformat(),
+                            len(missing_required_runs),
+                            len(required_times),
+                            missing_required_runs[0].isoformat(),
+                        )
+                    _maybe_log_progress(day_idx, len(day_order), sample_day)
+                    continue
+
+                day_start = time_module.monotonic()
+                if verbose_progress:
+                    n_source_fields = len(active_specs) * len(source_times)
+                    n_label_fields = len(label_times_unique)
+                    LOGGER.info(
+                        "Time-major day %s: loading %d source fields + %d label fields across %d runs for %d fire task(s)",
+                        sample_day.isoformat(),
+                        n_source_fields,
+                        n_label_fields,
+                        len(required_times),
+                        len(day_tasks),
+                    )
+
+                source_field_by_spec_time: dict[tuple[int, datetime], object] = {}
+                missing_day_field = False
+                source_jobs = [(spec_idx, spec, ts) for spec_idx, spec in enumerate(active_specs) for ts in source_times]
+                if worker_count <= 1:
+                    for load_idx, (spec_idx, spec, ts) in enumerate(source_jobs, start=1):
+                        da = reader.load_field(ts, spec)
+                        if da is None:
+                            missing_day_field = True
+                            break
+                        source_field_by_spec_time[(spec_idx, ts)] = da
+                        if verbose_progress and load_idx % max(1, len(source_jobs) // 4) == 0:
+                            LOGGER.info(
+                                "Time-major day %s source field load progress: %d/%d",
+                                sample_day.isoformat(),
+                                load_idx,
+                                len(source_jobs),
+                            )
+                else:
+                    source_futures = {
+                        pool.submit(reader.load_field, ts, spec): (spec_idx, spec, ts)
+                        for spec_idx, spec, ts in source_jobs
+                    }
+                    loaded_source = 0
+                    for fut in as_completed(source_futures):
+                        spec_idx, _spec, ts = source_futures[fut]
+                        da = fut.result()
+                        if da is None:
+                            missing_day_field = True
+                            for pending in source_futures:
+                                if not pending.done():
+                                    pending.cancel()
+                            break
+                        source_field_by_spec_time[(spec_idx, ts)] = da
+                        loaded_source += 1
+                        if verbose_progress and loaded_source % max(1, len(source_jobs) // 4) == 0:
+                            LOGGER.info(
+                                "Time-major day %s source field load progress: %d/%d",
+                                sample_day.isoformat(),
+                                loaded_source,
+                                len(source_jobs),
+                            )
+
+                label_field_by_time: dict[datetime, object] = {}
+                if not missing_day_field:
+                    if worker_count <= 1:
+                        for load_idx, ts in enumerate(label_times_unique, start=1):
+                            da = reader.load_field(ts, config.wildfire.label_variable)
+                            if da is None:
+                                missing_day_field = True
+                                break
+                            label_field_by_time[ts] = da
+                            if verbose_progress and load_idx % max(1, len(label_times_unique) // 2) == 0:
+                                LOGGER.info(
+                                    "Time-major day %s label field load progress: %d/%d",
+                                    sample_day.isoformat(),
+                                    load_idx,
+                                    len(label_times_unique),
+                                )
+                    else:
+                        label_futures = {
+                            pool.submit(reader.load_field, ts, config.wildfire.label_variable): ts
+                            for ts in label_times_unique
+                        }
+                        loaded_label = 0
+                        for fut in as_completed(label_futures):
+                            ts = label_futures[fut]
+                            da = fut.result()
+                            if da is None:
+                                missing_day_field = True
+                                for pending in label_futures:
+                                    if not pending.done():
+                                        pending.cancel()
+                                break
+                            label_field_by_time[ts] = da
+                            loaded_label += 1
+                            if verbose_progress and loaded_label % max(1, len(label_times_unique) // 2) == 0:
+                                LOGGER.info(
+                                    "Time-major day %s label field load progress: %d/%d",
+                                    sample_day.isoformat(),
+                                    loaded_label,
+                                    len(label_times_unique),
+                                )
+
+                if missing_day_field:
+                    skipped_missing_day_tasks += len(day_tasks)
+                    if verbose_progress:
+                        LOGGER.info("Time-major day %s skipped after field load (missing field data)", sample_day.isoformat())
+                    _maybe_log_progress(day_idx, len(day_order), sample_day)
+                    continue
+
+                days_with_loaded_fields += 1
+
+                day_results: list[tuple[_DailyTask, dict[str, np.ndarray], dict[int, np.ndarray]]] = []
+                day_patch_failures = 0
+                if worker_count <= 1:
+                    for task in day_tasks:
+                        result = _build_daily_task_patches_from_loaded_fields(
+                            task=task,
+                            config=config,
+                            patch_size=patch_size,
+                            source_times=source_times,
+                            label_times_by_lead=label_times_by_lead,
+                            active_specs=active_specs,
+                            hrrr_channels=hrrr_channels,
+                            source_field_by_spec_time=source_field_by_spec_time,
+                            label_field_by_time=label_field_by_time,
+                            viirs_rasterizer=viirs_rasterizer,
+                        )
+                        if result is None:
+                            skipped_patch_failures += 1
+                            day_patch_failures += 1
+                            continue
+                        input_patches, label_patches = result
+                        day_results.append((task, input_patches, label_patches))
+                else:
+                    futures = {
+                        pool.submit(
+                            _build_daily_task_patches_from_loaded_fields,
+                            task,
+                            config,
+                            patch_size,
+                            source_times,
+                            label_times_by_lead,
+                            active_specs,
+                            hrrr_channels,
+                            source_field_by_spec_time,
+                            label_field_by_time,
+                            viirs_rasterizer,
+                        ): task
+                        for task in day_tasks
+                    }
+                    patch_total = len(futures)
+                    patch_done = 0
+                    for fut in as_completed(futures):
+                        task = futures[fut]
+                        result = fut.result()
+                        patch_done += 1
+                        if verbose_progress and patch_done % max(1, patch_total // 4) == 0:
+                            LOGGER.info(
+                                "Time-major day %s patch build progress: %d/%d",
+                                sample_day.isoformat(),
+                                patch_done,
+                                patch_total,
+                            )
+                        if result is None:
+                            skipped_patch_failures += 1
+                            day_patch_failures += 1
+                            continue
+                        input_patches, label_patches = result
+                        day_results.append((task, input_patches, label_patches))
+
+                for task, input_patches, label_patches in day_results:
+                    write_idx: int | None = None
+                    for channel in channels:
+                        idx = _append_2d(input_arrays[channel], input_patches[channel].astype(np.float16, copy=False))
+                        if write_idx is None:
+                            write_idx = idx
+
+                    assert write_idx is not None
+                    for lead in leads:
+                        idx2 = _append_2d(label_arrays[lead], label_patches[lead].astype(np.float16, copy=False))
+                        if idx2 != write_idx:
+                            raise RuntimeError("Label and input array index misalignment")
+
+                    if write_idx < 16:
+                        config.paths.qa_tiff_dir.mkdir(parents=True, exist_ok=True)
+                        _maybe_write_qa_tiff(
+                            config.paths.qa_tiff_dir,
+                            write_idx,
+                            config.wildfire.frp_channel_name,
+                            input_patches[config.wildfire.frp_channel_name],
+                        )
+
+                    massden_patch = input_patches.get("MASSDEN_8m")
+                    ugrd10_patch = input_patches.get("UGRD_10m")
+                    vgrd10_patch = input_patches.get("VGRD_10m")
+                    persistence_mse_12 = np.nan
+                    persistence_mse_24 = np.nan
+                    advection_mse_12 = np.nan
+                    advection_mse_24 = np.nan
+                    if massden_patch is not None:
+                        if 12 in leads:
+                            persistence_mse_12 = float(np.nanmean((massden_patch - label_patches[12]) ** 2))
+                        if 24 in leads:
+                            persistence_mse_24 = float(np.nanmean((massden_patch - label_patches[24]) ** 2))
+                    if massden_patch is not None and ugrd10_patch is not None and vgrd10_patch is not None:
+                        if 12 in leads:
+                            adv12 = _advection_baseline(massden_patch, ugrd10_patch, vgrd10_patch, lead_hours=12)
+                            advection_mse_12 = float(np.nanmean((adv12 - label_patches[12]) ** 2))
+                        if 24 in leads:
+                            adv24 = _advection_baseline(massden_patch, ugrd10_patch, vgrd10_patch, lead_hours=24)
+                            advection_mse_24 = float(np.nanmean((adv24 - label_patches[24]) ** 2))
+
+                    row = {
+                        "sample_id": int(write_idx),
+                        "sample_key": task.sample_key,
+                        "fire_id": task.rec.unique_fire_id,
+                        "incident_name": task.rec.incident_name,
+                        "state": task.rec.state,
+                        "run_time_utc": task.run_time.isoformat(),
+                        "run_date": task.sample_day.isoformat(),
+                        "aggregation_mode": "daily_4h_mean",
+                        "source_hours_utc": ",".join(str(h) for h in source_hours_sorted),
+                        "bbox_min_lon": task.rec.min_lon,
+                        "bbox_min_lat": task.rec.min_lat,
+                        "bbox_max_lon": task.rec.max_lon,
+                        "bbox_max_lat": task.rec.max_lat,
+                        "size_acres": task.rec.size_acres,
+                        "split": task.split,
+                        "label_t_plus_12h_available": 12 in leads,
+                        "label_t_plus_24h_available": 24 in leads,
+                        "persistence_mse_t_plus_12h": persistence_mse_12,
+                        "persistence_mse_t_plus_24h": persistence_mse_24,
+                        "advection_mse_t_plus_12h": advection_mse_12,
+                        "advection_mse_t_plus_24h": advection_mse_24,
+                    }
+                    index_rows_buffer.append(row)
+                    completed_sample_keys.add(task.sample_key)
+                    sample_count += 1
+                    new_samples_written += 1
+
+                    if len(index_rows_buffer) >= flush_every:
+                        _flush_index_rows()
+
+                if verbose_progress:
+                    day_elapsed = max(1e-6, time_module.monotonic() - day_start)
+                    LOGGER.info(
+                        "Time-major day %s complete: wrote %d/%d sample(s) with %d patch failures in %.2fs (%.2f samples/s)",
+                        sample_day.isoformat(),
+                        len(day_results),
+                        len(day_tasks),
+                        day_patch_failures,
+                        day_elapsed,
+                        float(len(day_results)) / day_elapsed,
+                    )
+                _maybe_log_progress(day_idx, len(day_order), sample_day)
+    finally:
+        _flush_index_rows()
+
+    index_df = _materialize_index_parquet_from_checkpoint(
+        checkpoint_path=index_checkpoint,
+        index_path=config.paths.wildfire_index_output,
+        fallback_rows=existing_rows,
+    )
+    baseline_columns = [
+        "sample_id",
+        "split",
+        "persistence_mse_t_plus_12h",
+        "persistence_mse_t_plus_24h",
+        "advection_mse_t_plus_12h",
+        "advection_mse_t_plus_24h",
+    ]
+    baseline_summary = index_df.reindex(columns=baseline_columns).copy()
+    baseline_summary_path = config.paths.processed_dir / "forecast_baselines.parquet"
+    baseline_summary.to_parquet(baseline_summary_path, index=False)
+
+    elapsed_seconds = max(1e-6, time_module.monotonic() - start_time)
+    build_log = {
+        "fire_count": len(records),
+        "sample_count_written": int(sample_count),
+        "new_samples_written": int(new_samples_written),
+        "resumed_samples": int(resumed_samples),
+        "resume_enabled": bool(resume),
+        "resume_index_source": resume_source,
+        "index_checkpoint_path": str(index_checkpoint),
+        "checkpoint_flush_samples": int(flush_every),
+        "truncated_unindexed_samples": int(truncated_samples),
+        "extraction_mode": "time_major_daily",
+        "sort_times_by_fire_count": bool(sort_times_by_fire_count),
+        "candidate_tasks": int(candidate_tasks),
+        "pending_tasks_initial": int(pending_tasks),
+        "days_with_tasks": int(len(day_order)),
+        "days_with_loaded_fields": int(days_with_loaded_fields),
+        "missing_day_tasks": int(skipped_missing_day_tasks),
+        "missing_run_day_tasks": int(skipped_missing_run_day_tasks),
+        "patch_failure_tasks": int(skipped_patch_failures),
+        "throughput_new_samples_per_sec": float(new_samples_written / elapsed_seconds),
+        "elapsed_seconds": float(elapsed_seconds),
+        "frp_source": "VIIRS",
+        "channels_used": channels,
+        "label_leads": leads,
+        "estimated_sample_count": int(estimated_samples),
+        "estimated_bytes": int(estimated_bytes),
+        "budget_bytes": int(config.storage.budget_gb * (1024**3)),
+        "field_cache_entries": int(field_cache_entries),
+        "field_cache_hits": int(reader.cache_hits),
+        "field_cache_misses": int(reader.cache_misses),
+        "missing_run_skips": int(getattr(reader, "missing_run_skips", 0)),
+        "missing_field_skips": int(getattr(reader, "missing_field_skips", 0)),
+        "sample_hours_utc": source_hours_sorted,
+        "next_day_only": True,
+        "daily_aggregate": True,
+        "reused_next_day_massden_inputs": 0,
+        "reduction_actions": reduction_plan.actions,
+        "reduction_plan": {
+            "include_upper_air": reduction_plan.include_upper_air,
+            "cadence_after_72h": reduction_plan.cadence_after_72h,
+            "cap_samples_per_fire": reduction_plan.cap_samples_per_fire,
+        },
+        "baseline_summary_output": str(baseline_summary_path),
+    }
+
+    config.paths.dataset_build_log_output.parent.mkdir(parents=True, exist_ok=True)
+    config.paths.dataset_build_log_output.write_text(json.dumps(build_log, indent=2), encoding="utf-8")
+    _maybe_log_progress(len(day_order), len(day_order), day_order[-1] if day_order else config.run.start_date, force=True)
+
+    LOGGER.info(
+        "Wildfire raster build complete: total_samples=%d new_samples=%d resumed_samples=%d mode=time_major_daily (field cache hits=%d, misses=%d, missing-run-skips=%d, missing-field-skips=%d)",
+        sample_count,
+        new_samples_written,
+        resumed_samples,
+        reader.cache_hits,
+        reader.cache_misses,
+        getattr(reader, "missing_run_skips", 0),
+        getattr(reader, "missing_field_skips", 0),
+    )
+
+    return WildfireRasterStats(
+        fire_count=len(records),
+        sample_count=sample_count,
+        channels_used=len(channels),
+        estimated_bytes=estimated_bytes,
+    )
+
+
 def run(
     config: PipelineConfig,
     max_fires: int | None = None,
@@ -716,13 +1366,15 @@ def run(
     daily_aggregate: bool = False,
     resume: bool = True,
     checkpoint_flush_samples: int = 1,
+    time_major: bool = True,
+    sort_times_by_fire_count: bool = True,
+    verbose_progress: bool = False,
+    progress_interval_seconds: int = 60,
 ) -> WildfireRasterStats:
     records = load_filtered_fire_records(config)
+    records = sorted(records, key=lambda r: (r.start_time_utc, r.end_time_utc, r.unique_fire_id))
     if not records:
         raise ValueError("No wildfire records available after filtering")
-    records = sorted(records, key=lambda r: (r.start_time_utc, r.end_time_utc, r.unique_fire_id))
-    if max_fires is not None:
-        records = records[: int(max_fires)]
 
     if daily_aggregate and not next_day_only:
         raise ValueError("daily_aggregate mode requires --next-day-only for an unambiguous daily target")
@@ -734,6 +1386,47 @@ def run(
         sample_hours = normalized_hours
 
     leads = [24] if next_day_only else sorted(config.wildfire.label_lead_hours)
+    worker_count = _default_workers(workers)
+    field_cache_entries = max(32, min(256, worker_count * 16))
+    reader = HRRRAnalysisReader(config.hrrr, max_cache_entries=field_cache_entries)
+
+    if str(config.hrrr.bucket).lower() == "hrrrzarr" and str(config.hrrr.product).lower() == "sfc":
+        domain_bounds_xy = HRRR_CONUS_DOMAIN_BOUNDS_XY
+    else:
+        reference_spec = (
+            config.wildfire.analysis_variables[0]
+            if len(config.wildfire.analysis_variables) > 0
+            else config.wildfire.label_variable
+        )
+        domain_bounds_xy = _detect_hrrr_domain_bounds(
+            reader=reader,
+            reference_spec=reference_spec,
+            run_start=config.run.start_date,
+            run_end=config.run.end_date,
+        )
+    if domain_bounds_xy is None:
+        LOGGER.warning("Could not determine HRRR domain bounds; skipping domain pre-filter")
+    else:
+        original_record_count = len(records)
+        records, dropped_state_counts = _filter_records_to_hrrr_domain(
+            records=records,
+            buffer_km=config.wildfire.buffer_km,
+            domain_bounds_xy=domain_bounds_xy,
+        )
+        dropped_count = original_record_count - len(records)
+        if dropped_count > 0:
+            top_states = ", ".join(f"{state}:{count}" for state, count in Counter(dropped_state_counts).most_common(5))
+            LOGGER.info(
+                "Dropped %d wildfire records outside HRRR domain after %.1f km buffer (top states: %s)",
+                dropped_count,
+                config.wildfire.buffer_km,
+                top_states or "n/a",
+            )
+
+    if max_fires is not None:
+        records = records[: int(max_fires)]
+    if not records:
+        raise ValueError("No wildfire records intersect the HRRR domain after filtering")
 
     if daily_aggregate:
         reduction_plan, estimated_samples, estimated_bytes = _build_daily_reduction_plan(
@@ -757,16 +1450,17 @@ def run(
     hrrr_channels = [spec.channel_name or f"{spec.variable}_{spec.level}" for spec in active_specs]
     channels = [config.wildfire.frp_channel_name, *hrrr_channels]
     patch_size = tuple(config.wildfire.patch_size)
-    worker_count = _default_workers(workers)
     max_samples_cap = int(max_samples_total) if max_samples_total is not None else None
     flush_every = max(1, int(checkpoint_flush_samples))
     label_channel_name: str | None = None
+    label_input_spec: VariableSpec | None = None
     for spec, channel_name in zip(active_specs, hrrr_channels):
         if (
             spec.variable.upper() == config.wildfire.label_variable.variable.upper()
             and str(spec.level) == str(config.wildfire.label_variable.level)
         ):
             label_channel_name = channel_name
+            label_input_spec = spec
             break
 
     index_checkpoint = _index_checkpoint_path(config.paths.wildfire_index_output)
@@ -805,10 +1499,6 @@ def run(
     completed_sample_keys: set[str] = {str(row["sample_key"]) for row in existing_rows}
     resumed_samples = len(existing_rows)
 
-    # Keep an in-process LRU cache of full HRRR fields so repeated fire AOIs
-    # at the same (run_time, variable, level) do not trigger repeated S3 reads.
-    field_cache_entries = max(32, min(256, worker_count * 16))
-    reader = HRRRAnalysisReader(config.hrrr, max_cache_entries=field_cache_entries)
     viirs_df = load_or_build_viirs_hourly_points(config)
     viirs_rasterizer = build_viirs_rasterizer(viirs_df)
 
@@ -831,6 +1521,40 @@ def run(
         LOGGER.warning(
             "Truncated %d unindexed samples from existing zarr to align with resume index rows",
             truncated_samples,
+        )
+
+    if bool(time_major) and daily_aggregate:
+        return _run_daily_time_major(
+            config=config,
+            records=records,
+            active_specs=active_specs,
+            hrrr_channels=hrrr_channels,
+            channels=channels,
+            patch_size=patch_size,
+            worker_count=worker_count,
+            sample_hours=sample_hours,
+            leads=leads,
+            reduction_plan=reduction_plan,
+            estimated_samples=estimated_samples,
+            estimated_bytes=estimated_bytes,
+            max_samples_cap=max_samples_cap,
+            max_hours_per_fire=max_hours_per_fire,
+            completed_sample_keys=completed_sample_keys,
+            resumed_samples=resumed_samples,
+            existing_rows=existing_rows,
+            resume=bool(resume),
+            resume_source=resume_source,
+            index_checkpoint=index_checkpoint,
+            flush_every=flush_every,
+            reader=reader,
+            viirs_rasterizer=viirs_rasterizer,
+            input_arrays=input_arrays,
+            label_arrays=label_arrays,
+            field_cache_entries=field_cache_entries,
+            truncated_samples=truncated_samples,
+            sort_times_by_fire_count=bool(sort_times_by_fire_count),
+            verbose_progress=bool(verbose_progress),
+            progress_interval_seconds=max(1, int(progress_interval_seconds)),
         )
 
     sample_count = resumed_samples
@@ -933,17 +1657,96 @@ def run(
                         )
                         input_hourly[config.wildfire.frp_channel_name].append(frp_patch)
 
+                    # Stage A: load MASSDEN source/labels first so missing runs fail fast.
+                    if worker_count == 1:
+                        if label_channel_name is not None and label_input_spec is not None:
+                            if daily_aggregate and sample_day in next_day_label_cache:
+                                cached_patch = next_day_label_cache.pop(sample_day)
+                                input_hourly[label_channel_name] = [cached_patch] * len(source_times)
+                                reused_next_day_massden_inputs += 1
+                            else:
+                                for ts in source_times:
+                                    patch = _extract_patch(
+                                        reader,
+                                        run_time_utc=ts,
+                                        spec=label_input_spec,
+                                        bounds_xy=bounds_xy,
+                                        patch_size=patch_size,
+                                    )
+                                    if patch is None:
+                                        missing = True
+                                        break
+                                    input_hourly[label_channel_name].append(patch)
+
+                        if not missing:
+                            for lead, label_times in label_times_by_lead.items():
+                                for ts in label_times:
+                                    patch = _extract_patch(
+                                        reader,
+                                        run_time_utc=ts,
+                                        spec=config.wildfire.label_variable,
+                                        bounds_xy=bounds_xy,
+                                        patch_size=patch_size,
+                                    )
+                                    if patch is None:
+                                        missing = True
+                                        break
+                                    label_hourly[lead].append(patch)
+                                if missing:
+                                    break
+                    else:
+                        if label_channel_name is not None and label_input_spec is not None:
+                            if daily_aggregate and sample_day in next_day_label_cache:
+                                cached_patch = next_day_label_cache.pop(sample_day)
+                                input_hourly[label_channel_name] = [cached_patch] * len(source_times)
+                                reused_next_day_massden_inputs += 1
+                            else:
+                                futures = {
+                                    pool.submit(
+                                        _extract_patch_threaded,
+                                        reader,
+                                        ts,
+                                        label_input_spec,
+                                        bounds_xy,
+                                        patch_size,
+                                    ): ts
+                                    for ts in source_times
+                                }
+                                for fut in as_completed(futures):
+                                    patch = fut.result()
+                                    if patch is None:
+                                        missing = True
+                                        break
+                                    input_hourly[label_channel_name].append(patch)
+
+                        if not missing:
+                            futures = {}
+                            for lead, label_times in label_times_by_lead.items():
+                                for ts in label_times:
+                                    fut = pool.submit(
+                                        _extract_patch_threaded,
+                                        reader,
+                                        ts,
+                                        config.wildfire.label_variable,
+                                        bounds_xy,
+                                        patch_size,
+                                    )
+                                    futures[fut] = lead
+                            for fut in as_completed(futures):
+                                lead = int(futures[fut])
+                                patch = fut.result()
+                                if patch is None:
+                                    missing = True
+                                    break
+                                label_hourly[lead].append(patch)
+
+                    if missing:
+                        continue
+
+                    # Stage B: load remaining covariate channels.
                     if worker_count == 1:
                         for spec, channel_name in zip(active_specs, hrrr_channels):
-                            if (
-                                daily_aggregate
-                                and label_channel_name is not None
-                                and channel_name == label_channel_name
-                                and sample_day in next_day_label_cache
-                            ):
-                                cached_patch = next_day_label_cache.pop(sample_day)
-                                input_hourly[channel_name] = [cached_patch] * len(source_times)
-                                reused_next_day_massden_inputs += 1
+                            if label_channel_name is not None and channel_name == label_channel_name:
                                 continue
                             for ts in source_times:
                                 patch = _extract_patch(
@@ -959,38 +1762,10 @@ def run(
                                 input_hourly[channel_name].append(patch)
                             if missing:
                                 break
-
-                        if missing:
-                            continue
-
-                        for lead, label_times in label_times_by_lead.items():
-                            for ts in label_times:
-                                patch = _extract_patch(
-                                    reader,
-                                    run_time_utc=ts,
-                                    spec=config.wildfire.label_variable,
-                                    bounds_xy=bounds_xy,
-                                    patch_size=patch_size,
-                                )
-                                if patch is None:
-                                    missing = True
-                                    break
-                                label_hourly[lead].append(patch)
-                            if missing:
-                                break
                     else:
                         futures = {}
-                        if daily_aggregate and label_channel_name is not None and sample_day in next_day_label_cache:
-                            cached_patch = next_day_label_cache.pop(sample_day)
-                            input_hourly[label_channel_name] = [cached_patch] * len(source_times)
-                            reused_next_day_massden_inputs += 1
                         for spec, channel_name in zip(active_specs, hrrr_channels):
-                            if (
-                                daily_aggregate
-                                and label_channel_name is not None
-                                and channel_name == label_channel_name
-                                and len(input_hourly[channel_name]) == len(source_times)
-                            ):
+                            if label_channel_name is not None and channel_name == label_channel_name:
                                 continue
                             for ts in source_times:
                                 fut = pool.submit(
@@ -1001,30 +1776,15 @@ def run(
                                     bounds_xy,
                                     patch_size,
                                 )
-                                futures[fut] = ("input", channel_name)
-
-                        for lead, label_times in label_times_by_lead.items():
-                            for ts in label_times:
-                                fut = pool.submit(
-                                    _extract_patch_threaded,
-                                    reader,
-                                    ts,
-                                    config.wildfire.label_variable,
-                                    bounds_xy,
-                                    patch_size,
-                                )
-                                futures[fut] = ("label", lead)
+                                futures[fut] = channel_name
 
                         for fut in as_completed(futures):
-                            kind, key = futures[fut]
+                            channel_name = str(futures[fut])
                             patch = fut.result()
                             if patch is None:
                                 missing = True
                                 break
-                            if kind == "input":
-                                input_hourly[str(key)].append(patch)
-                            else:
-                                label_hourly[int(key)].append(patch)
+                            input_hourly[channel_name].append(patch)
 
                     if missing:
                         continue
@@ -1158,6 +1918,8 @@ def run(
         "field_cache_entries": int(field_cache_entries),
         "field_cache_hits": int(reader.cache_hits),
         "field_cache_misses": int(reader.cache_misses),
+        "missing_run_skips": int(getattr(reader, "missing_run_skips", 0)),
+        "missing_field_skips": int(getattr(reader, "missing_field_skips", 0)),
         "sample_hours_utc": sorted(sample_hours) if sample_hours is not None else "all",
         "next_day_only": bool(next_day_only),
         "daily_aggregate": bool(daily_aggregate),
@@ -1175,12 +1937,14 @@ def run(
     config.paths.dataset_build_log_output.write_text(json.dumps(build_log, indent=2), encoding="utf-8")
 
     LOGGER.info(
-        "Wildfire raster build complete: total_samples=%d new_samples=%d resumed_samples=%d (field cache hits=%d, misses=%d, next-day-massden-reuse=%d)",
+        "Wildfire raster build complete: total_samples=%d new_samples=%d resumed_samples=%d (field cache hits=%d, misses=%d, missing-run-skips=%d, missing-field-skips=%d, next-day-massden-reuse=%d)",
         sample_count,
         new_samples_written,
         resumed_samples,
         reader.cache_hits,
         reader.cache_misses,
+        getattr(reader, "missing_run_skips", 0),
+        getattr(reader, "missing_field_skips", 0),
         reused_next_day_massden_inputs,
     )
 

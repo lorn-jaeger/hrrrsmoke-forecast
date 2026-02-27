@@ -98,6 +98,30 @@ def _build_parser() -> argparse.ArgumentParser:
         default=1,
         help="Flush wildfire sample index checkpoint every N new samples.",
     )
+    wildfire_parser.add_argument(
+        "--time-major",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use time-major/day-major extraction (use --no-time-major for legacy fire-major path).",
+    )
+    wildfire_parser.add_argument(
+        "--sort-times-by-fire-count",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="In time-major mode, process busiest times first.",
+    )
+    wildfire_parser.add_argument(
+        "--verbose-progress",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Print higher-frequency progress logs.",
+    )
+    wildfire_parser.add_argument(
+        "--progress-interval-seconds",
+        type=int,
+        default=60,
+        help="Progress log interval in seconds when --verbose-progress is enabled.",
+    )
 
     return parser
 
@@ -165,6 +189,10 @@ def main() -> None:
             daily_aggregate=bool(args.daily_aggregate),
             resume=bool(args.resume),
             checkpoint_flush_samples=args.checkpoint_flush_samples,
+            time_major=bool(args.time_major),
+            sort_times_by_fire_count=bool(args.sort_times_by_fire_count),
+            verbose_progress=bool(args.verbose_progress),
+            progress_interval_seconds=args.progress_interval_seconds,
         )
         print(stats)
         return
