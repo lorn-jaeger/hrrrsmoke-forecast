@@ -27,7 +27,7 @@ from scripts.wfigs_viirs_stats import WfigsFire, load_wfigs_fires  # noqa: E402
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Animate GOES cloud mask vs VIIRS fire detections for one WFIGS fire")
+    parser = argparse.ArgumentParser(description="Animate GOES fire detections vs VIIRS fire detections for one WFIGS fire")
     parser.add_argument(
         "--wfigs-geojson",
         type=Path,
@@ -63,7 +63,7 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default="https://noaa-goes18.s3.amazonaws.com",
     )
-    parser.add_argument("--goes-prefix", type=str, default="ABI-L2-ACMC")
+    parser.add_argument("--goes-prefix", type=str, default="ABI-L2-FDCF")
     parser.add_argument(
         "--goes-cache-dir",
         type=Path,
@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("/Users/lorn/Code/gribcheck/reports/figures/goes_vs_viirs_animation.gif"),
+        default=Path("/Users/lorn/Code/gribcheck/reports/figures/goes_fire_vs_viirs_fire_animation.gif"),
     )
     return parser.parse_args()
 
@@ -313,8 +313,10 @@ def main() -> None:
             v_mask = np.zeros((args.grid_ny, args.grid_nx), dtype=np.uint8)
         else:
             half = timedelta(minutes=args.frame_step_minutes / 2.0)
-            lo = np.datetime64((dt - half).isoformat())
-            hi = np.datetime64((dt + half).isoformat())
+            lo_dt = (dt - half).astimezone(timezone.utc).replace(tzinfo=None)
+            hi_dt = (dt + half).astimezone(timezone.utc).replace(tzinfo=None)
+            lo = np.datetime64(lo_dt)
+            hi = np.datetime64(hi_dt)
             sel = (viirs_times >= lo) & (viirs_times <= hi)
             v_mask = np.zeros((args.grid_ny, args.grid_nx), dtype=np.uint8)
             if np.any(sel):
