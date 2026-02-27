@@ -57,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rebound-factor-min", type=float, default=2.0)
     parser.add_argument("--rebound-prev-frac-min", type=float, default=0.5)
     parser.add_argument("--max-fires", type=int, default=60)
+    parser.add_argument("--events-per-fire", type=int, default=1)
     parser.add_argument("--max-cloud-time-diff-min", type=float, default=30.0)
     parser.add_argument(
         "--cloud-base-url",
@@ -557,7 +558,9 @@ def write_report(df: pd.DataFrame, all_candidates: pd.DataFrame, output_dir: Pat
         ]
         top = top[cols]
         lines.append("## Top Events")
-        lines.append(top.to_markdown(index=False))
+        lines.append("```csv")
+        lines.append(top.to_csv(index=False))
+        lines.append("```")
 
     (output_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
     return summary
@@ -617,10 +620,25 @@ def main() -> None:
     candidates.to_csv(args.output_dir / "drop_rebound_candidates.csv", index=False)
     print(f"Drop-rebound candidates: {len(candidates):,}")
 
-    # Select top-scoring event per fire, then keep top N fires.
-    one_per_fire = candidates.sort_values("score", ascending=False).groupby("fire_idx", as_index=False).head(1)
-    selected = one_per_fire.sort_values("score", ascending=False).head(int(args.max_fires)).reset_index(drop=True)
-    print(f"Selected events for cloud check: {len(selected):,} across {selected['fire_idx'].nunique():,} fires")
+    # Select top N fires by best score, then keep K events per fire.
+    cand = candidates.sort_values("score", ascending=False).copy()
+    fire_rank = cand.groupby("fire_idx", as_index=False)["score"].max().sort_values("score", ascending=False)
+    keep_fires = fire_rank["fire_idx"].tolist()
+    if int(args.max_fires) > 0:
+        keep_fires = keep_fires[: int(args.max_fires)]
+    cand = cand[cand["fire_idx"].isin(keep_fires)]
+    selected = (
+        cand.sort_values("score", ascending=False)
+        .groupby("fire_idx", as_index=False)
+        .head(max(1, int(args.events_per_fire)))
+        .sort_values("score", ascending=False)
+        .reset_index(drop=True)
+    )
+    print(
+        f"Selected events for cloud check: {len(selected):,} "
+        f"across {selected['fire_idx'].nunique():,} fires "
+        f"(events_per_fire={int(args.events_per_fire)})"
+    )
 
     # Attach fire metadata.
     selected["fire_id"] = [fires[int(fi)].fire_id for fi in selected["fire_idx"]]

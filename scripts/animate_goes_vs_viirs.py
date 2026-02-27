@@ -350,6 +350,24 @@ def fetch_osm_static_map(min_lon: float, min_lat: float, max_lon: float, max_lat
         return None
 
 
+def nearest_idx_any_order(grid: np.ndarray, values: np.ndarray) -> np.ndarray:
+    grid = np.asarray(grid, dtype=np.float64)
+    if grid[0] <= grid[-1]:
+        ii = np.searchsorted(grid, values, side="left")
+        ii = np.clip(ii, 0, len(grid) - 1)
+        prev = np.clip(ii - 1, 0, len(grid) - 1)
+        ii = np.where(np.abs(grid[prev] - values) < np.abs(grid[ii] - values), prev, ii)
+        return ii.astype(np.int32)
+
+    # Descending grid: map through reversed ascending copy, then invert indices.
+    rev = grid[::-1]
+    jj = np.searchsorted(rev, values, side="left")
+    jj = np.clip(jj, 0, len(rev) - 1)
+    prev = np.clip(jj - 1, 0, len(rev) - 1)
+    jj = np.where(np.abs(rev[prev] - values) < np.abs(rev[jj] - values), prev, jj)
+    return (len(grid) - 1 - jj).astype(np.int32)
+
+
 def main() -> None:
     args = parse_args()
     args.goes_cache_dir.mkdir(parents=True, exist_ok=True)
@@ -460,15 +478,8 @@ def main() -> None:
         & (yr <= float(yg.max()))
     )
 
-    xi = np.searchsorted(xg, xr, side="left")
-    xi = np.clip(xi, 0, len(xg) - 1)
-    xi_prev = np.clip(xi - 1, 0, len(xg) - 1)
-    xi = np.where(np.abs(xg[xi_prev] - xr) < np.abs(xg[xi] - xr), xi_prev, xi).astype(np.int32)
-
-    yi = np.searchsorted(yg, yr, side="left")
-    yi = np.clip(yi, 0, len(yg) - 1)
-    yi_prev = np.clip(yi - 1, 0, len(yg) - 1)
-    yi = np.where(np.abs(yg[yi_prev] - yr) < np.abs(yg[yi] - yr), yi_prev, yi).astype(np.int32)
+    xi = nearest_idx_any_order(xg, xr)
+    yi = nearest_idx_any_order(yg, yr)
 
     # Precompute VIIRS held 12-hour bins.
     hold_hours = max(1, int(args.viirs_hold_hours))
