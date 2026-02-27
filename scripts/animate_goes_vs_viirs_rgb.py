@@ -5,6 +5,7 @@ import argparse
 import math
 import re
 import sys
+import time as time_module
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
@@ -26,7 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.wfigs_viirs_missing_causes_sample import GoesIndex, ensure_goes_file, http_get_bytes  # noqa: E402
+from scripts.wfigs_viirs_missing_causes_sample import GoesIndex, http_get_bytes  # noqa: E402
 from scripts.wfigs_viirs_stats import WfigsFire, load_wfigs_fires  # noqa: E402
 
 S3_XML_NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
@@ -359,22 +360,57 @@ class ViirsRgbIndex:
         return out
 
 
-def ensure_viirs_file(base_url: str, key: str, cache_dir: Path) -> Path:
+def ensure_remote_file(
+    base_url: str,
+    key: str,
+    cache_dir: Path,
+    min_bytes: int = 1000,
+    retries: int = 3,
+    timeout_sec: float = 45.0,
+) -> Path:
     cache_dir.mkdir(parents=True, exist_ok=True)
     out = cache_dir / key.split("/")[-1]
-    if out.exists() and out.stat().st_size > 1000:
+    if out.exists() and out.stat().st_size >= min_bytes:
         return out
-    data = http_get_bytes(
-        url=f"{base_url.rstrip('/')}/{key}",
-        timeout_sec=45.0,
+    url = f"{base_url.rstrip('/')}/{key}"
+    err: Exception | None = None
+    part = out.with_suffix(out.suffix + ".part")
+    for i in range(max(1, retries)):
+        try:
+            if part.exists():
+                part.unlink()
+            req = urllib.request.Request(url, headers={"User-Agent": "gribcheck/1.0 (rgb-animation)"})
+            with urllib.request.urlopen(req, timeout=timeout_sec) as resp, part.open("wb") as fp:
+                while True:
+                    chunk = resp.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    fp.write(chunk)
+            if part.stat().st_size < min_bytes:
+                raise RuntimeError(f"Downloaded file smaller than expected: {part.stat().st_size} bytes")
+            part.replace(out)
+            return out
+        except Exception as e:  # pragma: no cover - transient network errors
+            err = e
+            if part.exists():
+                part.unlink()
+            if i < retries - 1:
+                time_module.sleep(2.0 * (i + 1))
+    raise RuntimeError(f"Failed download after retries: {url}") from err
+
+
+def ensure_viirs_file(base_url: str, key: str, cache_dir: Path) -> Path:
+    return ensure_remote_file(
+        base_url=base_url,
+        key=key,
+        cache_dir=cache_dir,
+        min_bytes=1000,
         retries=3,
-        backoff_sec=2.0,
+        timeout_sec=45.0,
     )
-    out.write_bytes(data)
-    return out
 
 
-def load_viirs_times_for_bbox_time(
+def load_viirs_firms_for_bbox_time(
     viirs_zip: Path,
     min_lon: float,
     min_lat: float,
@@ -382,13 +418,13 @@ def load_viirs_times_for_bbox_time(
     max_lat: float,
     start_dt: datetime,
     end_dt: datetime,
-) -> pd.Series:
-    usecols = ["latitude", "longitude", "acq_date", "acq_time"]
+) -> pd.DataFrame:
+    usecols = ["latitude", "longitude", "acq_date", "acq_time", "daynight"]
     rows = []
     with zipfile.ZipFile(viirs_zip) as zf:
         members = [n for n in zf.namelist() if n.lower().endswith(".csv") and "archive" in n.lower()]
         if not members:
-            return pd.Series(dtype="datetime64[ns, UTC]")
+            return pd.DataFrame(columns=["acq_datetime", "latitude", "longitude", "daynight"])
         with zf.open(members[0]) as fp:
             for chunk in pd.read_csv(fp, usecols=usecols, chunksize=300_000, low_memory=False):
                 lat = pd.to_numeric(chunk["latitude"], errors="coerce")
@@ -399,13 +435,17 @@ def load_viirs_times_for_bbox_time(
                 sub = chunk.loc[keep].copy()
                 tm = sub["acq_time"].astype(str).str.strip().str.zfill(4)
                 dt_text = sub["acq_date"].astype(str).str.strip() + " " + tm.str.slice(0, 2) + ":" + tm.str.slice(2, 4)
-                dt = pd.to_datetime(dt_text, format="%Y-%m-%d %H:%M", errors="coerce", utc=True)
-                dt = dt[(dt >= start_dt) & (dt <= end_dt)]
-                if len(dt):
-                    rows.append(dt)
+                sub["acq_datetime"] = pd.to_datetime(dt_text, format="%Y-%m-%d %H:%M", errors="coerce", utc=True)
+                sub["latitude"] = pd.to_numeric(sub["latitude"], errors="coerce")
+                sub["longitude"] = pd.to_numeric(sub["longitude"], errors="coerce")
+                sub["daynight"] = sub["daynight"].astype(str).str.strip().str.upper()
+                sub = sub.dropna(subset=["acq_datetime", "latitude", "longitude"])
+                sub = sub[(sub["acq_datetime"] >= start_dt) & (sub["acq_datetime"] <= end_dt)]
+                if not sub.empty:
+                    rows.append(sub[["acq_datetime", "latitude", "longitude", "daynight"]])
     if not rows:
-        return pd.Series(dtype="datetime64[ns, UTC]")
-    return pd.concat(rows, ignore_index=True).sort_values().reset_index(drop=True)
+        return pd.DataFrame(columns=["acq_datetime", "latitude", "longitude", "daynight"])
+    return pd.concat(rows, ignore_index=True).sort_values("acq_datetime").reset_index(drop=True)
 
 
 def nearest_idx_any_order(grid: np.ndarray, values: np.ndarray) -> np.ndarray:
@@ -530,7 +570,7 @@ def grid_viirs_rgb(
         & np.isfinite(m4)
         & np.isfinite(m5)
         & np.isfinite(cosz)
-        & (cosz > 0.05)
+        & (cosz > 0.15)
         & (lon >= min_lon)
         & (lon <= max_lon)
         & (lat >= min_lat)
@@ -752,7 +792,14 @@ def main() -> None:
 
     first_triplet = next(t for t in nearest_goes if t is not None)
     c01_first, c02_first, c03_first = first_triplet
-    first_path = ensure_goes_file(args.goes_base_url, c02_first, args.goes_cache_dir)
+    first_path = ensure_remote_file(
+        base_url=args.goes_base_url,
+        key=c02_first,
+        cache_dir=args.goes_cache_dir,
+        min_bytes=1000,
+        retries=3,
+        timeout_sec=45.0,
+    )
     with Dataset(first_path) as ds:
         xg = ds.variables["x"][:].astype(np.float64)
         yg = ds.variables["y"][:].astype(np.float64)
@@ -799,9 +846,30 @@ def main() -> None:
         cached = goes_rgb_cache.get(trip)
         if cached is None:
             c01_key, c02_key, c03_key = trip
-            p01 = ensure_goes_file(args.goes_base_url, c01_key, args.goes_cache_dir)
-            p02 = ensure_goes_file(args.goes_base_url, c02_key, args.goes_cache_dir)
-            p03 = ensure_goes_file(args.goes_base_url, c03_key, args.goes_cache_dir)
+            p01 = ensure_remote_file(
+                base_url=args.goes_base_url,
+                key=c01_key,
+                cache_dir=args.goes_cache_dir,
+                min_bytes=1000,
+                retries=3,
+                timeout_sec=45.0,
+            )
+            p02 = ensure_remote_file(
+                base_url=args.goes_base_url,
+                key=c02_key,
+                cache_dir=args.goes_cache_dir,
+                min_bytes=1000,
+                retries=3,
+                timeout_sec=45.0,
+            )
+            p03 = ensure_remote_file(
+                base_url=args.goes_base_url,
+                key=c03_key,
+                cache_dir=args.goes_cache_dir,
+                min_bytes=1000,
+                retries=3,
+                timeout_sec=45.0,
+            )
 
             r = sample_goes_cmi_to_grid(p02, xr, yr, goes_map_cache)
             b = sample_goes_cmi_to_grid(p01, xr, yr, goes_map_cache)
@@ -824,8 +892,8 @@ def main() -> None:
         s = min(max(s, 0), n_slots - 1)
         frame_slot_idx.append(s)
 
-    print("Loading VIIRS FIRMS timing hints...")
-    viirs_times = load_viirs_times_for_bbox_time(
+    print("Loading VIIRS FIRMS rows in bbox/time...")
+    firms = load_viirs_firms_for_bbox_time(
         viirs_zip=args.viirs_zip,
         min_lon=minx,
         min_lat=miny,
@@ -834,20 +902,51 @@ def main() -> None:
         start_dt=start_dt,
         end_dt=end_dt,
     )
-    print(f"VIIRS timing hints in window: {len(viirs_times):,}")
+    print(f"VIIRS FIRMS rows in window: {len(firms):,}")
 
     slot_targets: list[datetime] = []
     slot_start_end: list[tuple[datetime, datetime]] = []
+    night_slot_masks = [np.zeros((args.grid_ny, args.grid_nx), dtype=np.uint8) for _ in range(n_slots)]
+    night_slot_points_lon = [[] for _ in range(n_slots)]
+    night_slot_points_lat = [[] for _ in range(n_slots)]
+    night_slot_counts = np.zeros(n_slots, dtype=np.int32)
+
+    slot_groups: dict[int, pd.DataFrame] = {}
+    if not firms.empty:
+        firms_ts = firms["acq_datetime"].astype("int64").to_numpy() / 1e9
+        slot_idx = np.floor((firms_ts - start_dt.timestamp()) / hold_sec).astype(np.int32)
+        slot_idx = np.clip(slot_idx, 0, n_slots - 1)
+        firms = firms.copy()
+        firms["slot_idx"] = slot_idx
+        slot_groups = {int(k): g.copy() for k, g in firms.groupby("slot_idx")}
+
+        # Build slot-level nighttime detections from FIRMS day/night flag.
+        n_rows = firms[firms["daynight"] == "N"]
+        if not n_rows.empty:
+            vx = n_rows["longitude"].to_numpy(dtype=np.float64)
+            vy = n_rows["latitude"].to_numpy(dtype=np.float64)
+            ss = n_rows["slot_idx"].to_numpy(dtype=np.int32)
+            iix = np.clip(np.searchsorted(lon_grid, vx, side="left"), 0, len(lon_grid) - 1)
+            iiy = np.clip(np.searchsorted(lat_grid, vy, side="left"), 0, len(lat_grid) - 1)
+            for s, ix, iy, lon, lat in zip(ss, iix, iiy, vx, vy, strict=True):
+                si = int(s)
+                night_slot_masks[si][int(iy), int(ix)] = 1
+                night_slot_points_lon[si].append(float(lon))
+                night_slot_points_lat[si].append(float(lat))
+                night_slot_counts[si] += 1
+
     for s in range(n_slots):
         ss = start_dt + timedelta(seconds=s * hold_sec)
         ee = min(end_dt, ss + timedelta(seconds=hold_sec))
         slot_start_end.append((ss, ee))
-        if not viirs_times.empty:
-            sub = viirs_times[(viirs_times >= ss) & (viirs_times < ee)]
-            if len(sub):
-                mid = sub.iloc[len(sub) // 2].to_pydatetime()
-                slot_targets.append(mid.astimezone(timezone.utc))
-                continue
+        # Prefer daytime detections to keep VIIRS true-color from landing on dark night frames.
+        sub = slot_groups.get(s)
+        if sub is not None and not sub.empty:
+            day_sub = sub[sub["daynight"] == "D"]
+            src = day_sub if not day_sub.empty else sub
+            mid = src["acq_datetime"].iloc[len(src) // 2].to_pydatetime()
+            slot_targets.append(mid.astimezone(timezone.utc))
+            continue
         slot_targets.append(ss + (ee - ss) / 2)
 
     print("Preparing VIIRS RGB slot images...")
@@ -859,7 +958,7 @@ def main() -> None:
         candidates = viirs_idx.nearest_triplets(target_dt=target_dt, search_hours=args.viirs_search_hours)
         slot_img = np.zeros((args.grid_ny, args.grid_nx, 3), dtype=np.uint8)
         label = "No VIIRS RGB"
-        for _diff_sec, m3, m4, m5, geo in candidates[:12]:
+        for _diff_sec, m3, m4, m5, geo in candidates[:40]:
             if m3.stem in viirs_rgb_cache:
                 slot_img = viirs_rgb_cache[m3.stem]
                 label = f"VIIRS {m3.start_time_utc.strftime('%Y-%m-%d %H:%M UTC')}"
@@ -912,8 +1011,8 @@ def main() -> None:
         bg_img = fetch_osm_static_map(minx, miny, maxx, maxy, args.map_width, args.map_height)
 
     print("Rendering animation...")
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
-    ax_go, ax_vi = axes
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6), constrained_layout=True)
+    ax_go, ax_vi, ax_night = axes
     for ax in axes:
         if bg_img is not None:
             ax.imshow(bg_img, extent=extent, origin="upper", alpha=args.map_alpha, zorder=0)
@@ -929,21 +1028,32 @@ def main() -> None:
     s0 = frame_slot_idx[i0]
     im_go = ax_go.imshow(goes_frames[i0], origin="lower", extent=extent, zorder=2)
     im_vi = ax_vi.imshow(viirs_slots[s0], origin="lower", extent=extent, zorder=2)
+    im_night = ax_night.imshow(night_slot_masks[s0], origin="lower", extent=extent, cmap="magma", vmin=0, vmax=1, alpha=0.75, zorder=2)
+    sc_night = ax_night.scatter([], [], s=9, c="#7ff7ff", alpha=0.85, linewidths=0.0, zorder=4)
     ax_go.set_title("GOES-18 RGB (C02 + synthetic G + C01)")
-    ax_vi.set_title(f"VIIRS True Color (M5/M4/M3, held {hold_hours}h)")
+    ax_vi.set_title(f"VIIRS True Color (day-preferred, held {hold_hours}h)")
+    ax_night.set_title(f"VIIRS FIRMS Night Detections (held {hold_hours}h)")
     supt = fig.suptitle("")
 
     def update(frame_i: int):
         slot_i = frame_slot_idx[frame_i]
         im_go.set_data(goes_frames[frame_i])
         im_vi.set_data(viirs_slots[slot_i])
+        im_night.set_data(night_slot_masks[slot_i])
+        lon_pts = night_slot_points_lon[slot_i]
+        lat_pts = night_slot_points_lat[slot_i]
+        if lon_pts:
+            sc_night.set_offsets(np.column_stack([lon_pts, lat_pts]))
+        else:
+            sc_night.set_offsets(np.empty((0, 2), dtype=np.float64))
         ss, ee = slot_start_end[slot_i]
         supt.set_text(
             f"{fire.fire_id} | {fire.name} | frame {frame_i + 1}/{len(schedule)} | "
             f"GOES {schedule[frame_i].strftime('%Y-%m-%d %H:%M UTC')} | "
-            f"{viirs_slot_label[slot_i]} | slot {ss.strftime('%m-%d %H:%M')} - {ee.strftime('%m-%d %H:%M')} UTC"
+            f"{viirs_slot_label[slot_i]} | Night FIRMS: {int(night_slot_counts[slot_i])} | "
+            f"slot {ss.strftime('%m-%d %H:%M')} - {ee.strftime('%m-%d %H:%M')} UTC"
         )
-        return im_go, im_vi, supt
+        return im_go, im_vi, im_night, sc_night, supt
 
     anim = FuncAnimation(fig, update, frames=len(schedule), interval=100, blit=False)
     out = args.output
