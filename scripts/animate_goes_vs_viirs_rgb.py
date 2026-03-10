@@ -32,6 +32,7 @@ from scripts.wfigs_viirs_missing_causes_sample import GoesIndex, http_get_bytes 
 from scripts.wfigs_viirs_stats import WfigsFire, load_wfigs_fires  # noqa: E402
 
 S3_XML_NS = {"s3": "http://s3.amazonaws.com/doc/2006-03-01/"}
+GOES_FIRE_VALUES = np.array([10, 11, 12, 13, 14, 15, 30, 31, 32, 33, 34, 35], dtype=np.int16)
 
 
 @dataclass
@@ -301,6 +302,51 @@ def nearest_goes_triplets_for_schedule(
     keys = [(c01, c02, c03) for _dt, c01, c02, c03 in triplets]
     out: list[tuple[str, str, str] | None] = []
 
+    for dt in schedule:
+        target = dt.timestamp()
+        pos = int(np.searchsorted(ts, target))
+        cand = []
+        if 0 <= pos < len(ts):
+            cand.append(pos)
+        if pos - 1 >= 0:
+            cand.append(pos - 1)
+        if pos + 1 < len(ts):
+            cand.append(pos + 1)
+        if not cand:
+            out.append(None)
+            continue
+        best_i = min(cand, key=lambda i: abs(ts[i] - target))
+        diff_min = abs(ts[best_i] - target) / 60.0
+        out.append(keys[best_i] if diff_min <= max_abs_minutes else None)
+    return out
+
+
+def list_goes_keys_for_range(idx: GoesIndex, start_dt: datetime, end_dt: datetime) -> list[tuple[datetime, str]]:
+    by_key: dict[str, datetime] = {}
+    cursor = start_dt.replace(minute=0, second=0, microsecond=0)
+    end_hr = end_dt.replace(minute=0, second=0, microsecond=0)
+    while cursor <= end_hr:
+        year = cursor.year
+        doy = cursor.timetuple().tm_yday
+        hour = cursor.hour
+        for ref in idx.list_hour(year, doy, hour):
+            if start_dt <= ref.start_time_utc <= end_dt:
+                by_key[ref.key] = ref.start_time_utc
+        cursor += timedelta(hours=1)
+    return sorted([(v, k) for k, v in by_key.items()], key=lambda x: x[0])
+
+
+def nearest_goes_keys_for_schedule(
+    schedule: list[datetime],
+    goes_items: list[tuple[datetime, str]],
+    max_abs_minutes: float,
+) -> list[str | None]:
+    if not goes_items:
+        return [None] * len(schedule)
+
+    ts = np.array([dt.timestamp() for dt, _k in goes_items], dtype=np.float64)
+    keys = [k for _dt, k in goes_items]
+    out: list[str | None] = []
     for dt in schedule:
         target = dt.timestamp()
         pos = int(np.searchsorted(ts, target))
@@ -597,6 +643,65 @@ def sample_goes_cmi_to_grid(
         ix = xi[valid_mask] - x0
         vals[valid_mask] = cmi[iy, ix]
     return vals
+
+
+def sample_goes_fdcf_fire_mask(
+    path: Path,
+    xr: np.ndarray,
+    yr: np.ndarray,
+    map_cache: dict[tuple[int, int, float, float, float, float], tuple[np.ndarray, np.ndarray, np.ndarray, int, int, int, int]],
+) -> np.ndarray:
+    with Dataset(path) as ds:
+        if "Mask" not in ds.variables:
+            return np.zeros(xr.shape, dtype=np.uint8)
+        xg = ds.variables["x"][:].astype(np.float64)
+        yg = ds.variables["y"][:].astype(np.float64)
+        mk = (len(xg), len(yg), float(xg[0]), float(xg[-1]), float(yg[0]), float(yg[-1]))
+        mapping = map_cache.get(mk)
+        if mapping is None:
+            valid_mask = (
+                np.isfinite(xr)
+                & np.isfinite(yr)
+                & (xr >= float(xg.min()))
+                & (xr <= float(xg.max()))
+                & (yr >= float(yg.min()))
+                & (yr <= float(yg.max()))
+            )
+            if np.any(valid_mask):
+                xi = nearest_idx_any_order(xg, xr)
+                yi = nearest_idx_any_order(yg, yr)
+                x0 = int(np.min(xi[valid_mask]))
+                x1 = int(np.max(xi[valid_mask]))
+                y0 = int(np.min(yi[valid_mask]))
+                y1 = int(np.max(yi[valid_mask]))
+            else:
+                xi = np.zeros_like(xr, dtype=np.int32)
+                yi = np.zeros_like(yr, dtype=np.int32)
+                x0 = x1 = y0 = y1 = 0
+            mapping = (xi, yi, valid_mask, x0, x1, y0, y1)
+            map_cache[mk] = mapping
+        xi, yi, valid_mask, x0, x1, y0, y1 = mapping
+
+        mask = np.asarray(ds.variables["Mask"][y0 : y1 + 1, x0 : x1 + 1], dtype=np.int16)
+        vals = np.full(xr.shape, -1, dtype=np.int16)
+        if np.any(valid_mask):
+            iy = yi[valid_mask] - y0
+            ix = xi[valid_mask] - x0
+            vals[valid_mask] = mask[iy, ix]
+
+        fire_like = np.isin(vals, GOES_FIRE_VALUES)
+        if "DQF" in ds.variables:
+            dqf = np.asarray(ds.variables["DQF"][y0 : y1 + 1, x0 : x1 + 1], dtype=np.int16)
+            q = np.full(xr.shape, 9, dtype=np.int16)
+            if np.any(valid_mask):
+                iy = yi[valid_mask] - y0
+                ix = xi[valid_mask] - x0
+                q[valid_mask] = dqf[iy, ix]
+            fire_like &= (q <= 1)
+
+        out = np.zeros(xr.shape, dtype=np.uint8)
+        out[fire_like] = 1
+        return out
 
 
 def to_uint8_rgb(rgb_f32: np.ndarray) -> np.ndarray:
@@ -986,12 +1091,53 @@ def main() -> None:
     )
     print(f"VIIRS FIRMS rows in window: {len(firms):,}")
 
+    print("Listing GOES FDCF detection files...")
+    fdcf_idx = GoesIndex(base_url=args.goes_base_url, product_prefix="ABI-L2-FDCF")
+    fdcf_items = list_goes_keys_for_range(fdcf_idx, start_dt=start_dt, end_dt=end_dt)
+    nearest_fdcf = nearest_goes_keys_for_schedule(schedule, fdcf_items, max_abs_minutes=args.goes_max_abs_minutes)
+    usable_fdcf = sum(1 for k in nearest_fdcf if k is not None)
+    print(f"GOES FDCF matched frames: {usable_fdcf:,}/{len(schedule):,}")
+
+    goes_det_cache: dict[str, np.ndarray] = {}
+    goes_det_frames: list[np.ndarray] = []
+    goes_det_counts = np.zeros(len(schedule), dtype=np.int32)
+    for i, key in enumerate(nearest_fdcf, start=1):
+        if key is None:
+            gdet = np.zeros((args.grid_ny, args.grid_nx), dtype=np.uint8)
+        else:
+            cached = goes_det_cache.get(key)
+            if cached is None:
+                path = ensure_remote_file(
+                    base_url=args.goes_base_url,
+                    key=key,
+                    cache_dir=args.goes_cache_dir,
+                    min_bytes=1000,
+                    retries=3,
+                    timeout_sec=45.0,
+                )
+                gdet = sample_goes_fdcf_fire_mask(path, xr, yr, goes_map_cache)
+                goes_det_cache[key] = gdet
+            else:
+                gdet = cached
+        goes_det_frames.append(gdet)
+        goes_det_counts[i - 1] = int(gdet.sum())
+        if i % 40 == 0:
+            print(f"Prepared GOES detection frames: {i}/{len(schedule)}")
+
+    goes_det_cum: list[np.ndarray] = []
+    gac = np.zeros((args.grid_ny, args.grid_nx), dtype=np.uint8)
+    goes_det_cum_counts = np.zeros(len(schedule), dtype=np.int32)
+    for i, gdet in enumerate(goes_det_frames):
+        gac = np.maximum(gac, gdet)
+        goes_det_cum.append(gac.copy())
+        goes_det_cum_counts[i] = int(gac.sum())
+
     slot_targets: list[datetime] = []
     slot_start_end: list[tuple[datetime, datetime]] = []
-    night_slot_masks = [np.zeros((args.grid_ny, args.grid_nx), dtype=np.uint8) for _ in range(n_slots)]
-    night_slot_points_lon = [[] for _ in range(n_slots)]
-    night_slot_points_lat = [[] for _ in range(n_slots)]
-    night_slot_counts = np.zeros(n_slots, dtype=np.int32)
+    viirs_slot_masks = [np.zeros((args.grid_ny, args.grid_nx), dtype=np.uint8) for _ in range(n_slots)]
+    viirs_slot_points_lon = [[] for _ in range(n_slots)]
+    viirs_slot_points_lat = [[] for _ in range(n_slots)]
+    viirs_slot_counts = np.zeros(n_slots, dtype=np.int32)
 
     slot_groups: dict[int, pd.DataFrame] = {}
     if not firms.empty:
@@ -1002,20 +1148,17 @@ def main() -> None:
         firms["slot_idx"] = slot_idx
         slot_groups = {int(k): g.copy() for k, g in firms.groupby("slot_idx")}
 
-        # Build slot-level nighttime detections from FIRMS day/night flag.
-        n_rows = firms[firms["daynight"] == "N"]
-        if not n_rows.empty:
-            vx = n_rows["longitude"].to_numpy(dtype=np.float64)
-            vy = n_rows["latitude"].to_numpy(dtype=np.float64)
-            ss = n_rows["slot_idx"].to_numpy(dtype=np.int32)
-            iix = np.clip(np.searchsorted(lon_grid, vx, side="left"), 0, len(lon_grid) - 1)
-            iiy = np.clip(np.searchsorted(lat_grid, vy, side="left"), 0, len(lat_grid) - 1)
-            for s, ix, iy, lon, lat in zip(ss, iix, iiy, vx, vy, strict=True):
-                si = int(s)
-                night_slot_masks[si][int(iy), int(ix)] = 1
-                night_slot_points_lon[si].append(float(lon))
-                night_slot_points_lat[si].append(float(lat))
-                night_slot_counts[si] += 1
+        vx = firms["longitude"].to_numpy(dtype=np.float64)
+        vy = firms["latitude"].to_numpy(dtype=np.float64)
+        ss = firms["slot_idx"].to_numpy(dtype=np.int32)
+        iix = np.clip(np.searchsorted(lon_grid, vx, side="left"), 0, len(lon_grid) - 1)
+        iiy = np.clip(np.searchsorted(lat_grid, vy, side="left"), 0, len(lat_grid) - 1)
+        for s, ix, iy, lon, lat in zip(ss, iix, iiy, vx, vy, strict=True):
+            si = int(s)
+            viirs_slot_masks[si][int(iy), int(ix)] = 1
+            viirs_slot_points_lon[si].append(float(lon))
+            viirs_slot_points_lat[si].append(float(lat))
+            viirs_slot_counts[si] += 1
 
     for s in range(n_slots):
         ss = start_dt + timedelta(seconds=s * hold_sec)
@@ -1030,6 +1173,14 @@ def main() -> None:
                 slot_targets.append(mid.astimezone(timezone.utc))
                 continue
         slot_targets.append(ss + (ee - ss) / 2)
+
+    viirs_slot_cum: list[np.ndarray] = []
+    vac = np.zeros((args.grid_ny, args.grid_nx), dtype=np.uint8)
+    viirs_slot_cum_counts = np.zeros(n_slots, dtype=np.int32)
+    for i, m in enumerate(viirs_slot_masks):
+        vac = np.maximum(vac, m)
+        viirs_slot_cum.append(vac.copy())
+        viirs_slot_cum_counts[i] = int(vac.sum())
 
     print("Preparing VIIRS RGB slot images...")
     viirs_slots: list[np.ndarray] = []
@@ -1149,7 +1300,7 @@ def main() -> None:
 
     print("Rendering animation...")
     fig, axes = plt.subplots(1, 3, figsize=(18, 6), constrained_layout=True)
-    ax_go, ax_vi, ax_night = axes
+    ax_go, ax_vi, ax_det = axes
     for ax in axes:
         if bg_img is not None:
             ax.imshow(bg_img, extent=extent, origin="upper", alpha=args.map_alpha, zorder=0)
@@ -1165,35 +1316,39 @@ def main() -> None:
     s0 = frame_slot_idx[i0]
     im_go = ax_go.imshow(goes_frames[i0], origin="lower", extent=extent, zorder=2)
     im_vi = ax_vi.imshow(viirs_slots[s0], origin="lower", extent=extent, zorder=2)
-    im_night = ax_night.imshow(night_slot_masks[s0], origin="lower", extent=extent, cmap="magma", vmin=0, vmax=1, alpha=0.75, zorder=2)
-    sc_night = ax_night.scatter([], [], s=9, c="#7ff7ff", alpha=0.85, linewidths=0.0, zorder=4)
+    im_det_go = ax_det.imshow(goes_det_cum[i0], origin="lower", extent=extent, cmap="Reds", vmin=0, vmax=1, alpha=0.45, zorder=2)
+    im_det_vi = ax_det.imshow(viirs_slot_cum[s0], origin="lower", extent=extent, cmap="Blues", vmin=0, vmax=1, alpha=0.45, zorder=3)
+    sc_vi = ax_det.scatter([], [], s=8, c="#62f5ff", alpha=0.9, linewidths=0.0, zorder=4)
     ax_go.set_title("GOES-18 RGB (C02 + synthetic G + C01)")
     if args.viirs_rgb_source == "gibs":
         ax_vi.set_title("VIIRS True Color (GIBS daily)")
     else:
         ax_vi.set_title(f"VIIRS True Color (day-preferred SDR, held {hold_hours}h)")
-    ax_night.set_title(f"VIIRS FIRMS Night Detections (held {hold_hours}h)")
+    ax_det.set_title("Detections Over Time (VIIRS blue, GOES red)")
     supt = fig.suptitle("")
 
     def update(frame_i: int):
         slot_i = frame_slot_idx[frame_i]
         im_go.set_data(goes_frames[frame_i])
         im_vi.set_data(viirs_slots[slot_i])
-        im_night.set_data(night_slot_masks[slot_i])
-        lon_pts = night_slot_points_lon[slot_i]
-        lat_pts = night_slot_points_lat[slot_i]
+        im_det_go.set_data(goes_det_cum[frame_i])
+        im_det_vi.set_data(viirs_slot_cum[slot_i])
+        lon_pts = viirs_slot_points_lon[slot_i]
+        lat_pts = viirs_slot_points_lat[slot_i]
         if lon_pts:
-            sc_night.set_offsets(np.column_stack([lon_pts, lat_pts]))
+            sc_vi.set_offsets(np.column_stack([lon_pts, lat_pts]))
         else:
-            sc_night.set_offsets(np.empty((0, 2), dtype=np.float64))
+            sc_vi.set_offsets(np.empty((0, 2), dtype=np.float64))
         ss, ee = slot_start_end[slot_i]
         supt.set_text(
             f"{fire.fire_id} | {fire.name} | frame {frame_i + 1}/{len(schedule)} | "
             f"GOES {schedule[frame_i].strftime('%Y-%m-%d %H:%M UTC')} | "
-            f"{viirs_slot_label[slot_i]} | Night FIRMS: {int(night_slot_counts[slot_i])} | "
+            f"{viirs_slot_label[slot_i]} | "
+            f"VIIRS slot/cum: {int(viirs_slot_counts[slot_i])}/{int(viirs_slot_cum_counts[slot_i])} | "
+            f"GOES frame/cum: {int(goes_det_counts[frame_i])}/{int(goes_det_cum_counts[frame_i])} | "
             f"slot {ss.strftime('%m-%d %H:%M')} - {ee.strftime('%m-%d %H:%M')} UTC"
         )
-        return im_go, im_vi, im_night, sc_night, supt
+        return im_go, im_vi, im_det_go, im_det_vi, sc_vi, supt
 
     anim = FuncAnimation(fig, update, frames=len(schedule), interval=100, blit=False)
     out = args.output
